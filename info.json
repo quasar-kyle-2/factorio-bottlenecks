@@ -1,0 +1,13 @@
+{
+  "name": "bottleneck-calc-extreme",
+  "version": "0.2.1",
+  "factorio_version": "2.1",
+  "title": "Bottleneck Calculator Extreme",
+  "author": "Kyle",
+  "description": "Select your labs (or any buildings). Scans the whole surface and finds which buildings you need more of to make them run faster. Inspired by sw-rates-calc-extreme.",
+  "dependencies": [
+    "sw-rates-lib >= 0.5.7",
+    "sw-entity-tracker",
+    "flib"
+  ]
+}

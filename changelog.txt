@@ -1,0 +1,146 @@
+---------------------------------------------------------------------------------------------------
+Version: 0.2.1
+Date: 2026-11-19
+  Features:
+    - Item report: click an item for where it goes and where it comes from, under the
+      targets. Every building using it (and how many of them are waiting for it right now), every
+      building making it (what else it makes, which of its own inputs are short, what it is doing
+      now), and what the item mostly becomes on the way to your targets. Click any item icon in
+      the report for that item's report
+    - Item report: "Goes to" shows what each building makes with the item, shortest first, and the
+      way to your targets follows a short product where there is one (that is what the building is
+      pushed for)
+    - Click a building icon in the item report to show those buildings on the map (each click the
+      next one), with green boxes around all of them for 12 seconds
+  Changes:
+    - Compact (pinned) view: shows the Items pane with only the difference column (20 short items,
+      then how many more; Enough as two counts: balanced and surplus), "Add consumers", the targets'
+      speeds without sliders, and a slimmer item report (just the difference at the top, no live
+      status, only short products, one difference column for what buildings make, a narrower path)
+    - The rescan button says "Refresh" next to its icon
+    - Item report: the difference replaces the coverage at the top
+    - Ash is no longer hard-coded as unlimited: any item a fuel leaves behind when burnt, that no
+      recipe refills one for one into that fuel, counts as waste (ash, spent nuclear fuel cells).
+      Empty canisters, used batteries and used animals stay counted
+    - Item icons: click opens the item report, right-click switches unlimited on and off
+    - Fluid icons can be pipetted too, like items
+    - The report uses the buildings you already have first, and only plans past them where it
+      has to. Needs now grow steadily as you turn a target up, instead of jumping between
+      recipes from one speed to the next
+    - Where it has to go past your buildings, it prices each extra building by what it takes to
+      fit in: its width, one per item or fluid it uses or makes, +1 for heat, +2 for burnt fuel
+      (+1 for fluid fuel), whatever you already have of it
+    - Items needed at a negligible rate (solver crumbs) are no longer listed
+    - Speed sliders snap to 0, 10, 20, 30, 40, 50, 60, 80, 100, 150 and 200%. Moving one no longer
+      starts working right away: the new speed shows in yellow until you press Apply
+    - The difference has its own column, and is hidden when it is basically 0
+    - Coverage colors: yellow below 105% (and for short items that round to 100%), green from 105%
+    - Enough lists the items up to 125% coverage, then skips the surplus ones but the 20 most
+      over-covered
+    - The Apply button hides once the new speeds are worked out; the window is taller
+    - Item columns line up across tables; the most over-covered items get their own column headers
+    - With nothing short, Short (0) says so, and Enough has no empty header row
+    - The Targets pane fills its frame when empty
+    - The progress percentage follows the solve more closely instead of sitting at 99%
+    - Items made by a show-only recipe (hidden, out of nothing) are treated as unlimited: Pyanodon's
+      dig sites claim 4000 nexelit ore per second, while their digosaurs really mine it by script
+  Bugfixes:
+    - No blank first line in item icon tooltips
+---------------------------------------------------------------------------------------------------
+Version: 0.2.0
+Date: 2026-11-19
+  Major Features:
+    - New report: for every item your targets' supply chain uses, how much is needed and how much
+      your factory can make, and the coverage (can make / needed). Short items first, lowest
+      coverage first: the order things run out in as your targets speed up. Each item is counted
+      as if everything it needs were there, so a shortage upstream never hides what is needed
+      further down; only what the targets need counts (sinks, buildables and other consumers
+      add nothing)
+    - A speed for each target group (slider, 0-200%): the report is worked out for those speeds.
+      Changing one continues from the last answer (under a second on a large base)
+  Changes:
+    - Ash is treated as unlimited, like water: getting rid of it isn't a real use
+    - Removed: bottlenecks, limiting items, must-run targets, build plans and "what it takes"
+      (0.1.14 is kept in Factorio/mod-archive)
+    - Clicking an item switches it between counted and unlimited
+---------------------------------------------------------------------------------------------------
+Version: 0.1.14
+Date: 2026-11-19
+  Features:
+    - "Targets +10%: what to build": the fewest new buildings that make all targets run 10% faster,
+      looking at everything they run short of together. Worked out automatically after every scan,
+      starting from the solved factory (about 15 s plus a 10 s check on a large base), with its size
+      ("7 more buildings across 6 setups"), the targets' speed once built and the next limit.
+      Click x to cancel it (it can be resumed) when only the item lists are needed
+  Changes:
+    - Limiting items show "+10% supply -> +X%" again: the headroom checks from 0.1.13 took about
+      2 minutes on a large base, and the targets' plan answers "how much to build" in one go
+    - Right-click plans start at +10% again
+---------------------------------------------------------------------------------------------------
+Version: 0.1.13
+Date: 2026-11-19
+  Features:
+    - Limiting items show how far more of them helps: "up to +6% more → +1.2%, then [lead] runs
+      short", or "twice as much → +4.6%" when it keeps helping. Worked out in the background
+      after the results are shown, strongest items first, with a progress line
+    - Limiting items are sorted by what the targets really gain
+    - "What it takes" starts with a "Next limit" goal: just enough of the item to reach its
+      next limit
+  Changes:
+    - "+10% supply → +X%" (which assumed the item keeps helping that far) is only shown for items
+      further down the list
+---------------------------------------------------------------------------------------------------
+Version: 0.1.12
+Date: 2026-11-18
+  Changes:
+    - The Bottlenecks section is switched off: one more of a single building rarely moved the
+      targets much. Right-click a limiting item for "What it takes" instead. Results are ready
+      as soon as the solver finishes (no more "+1 building" checks)
+    - The other buildings are listed as a count under "Supply chain"
+---------------------------------------------------------------------------------------------------
+Version: 0.1.11
+Date: 2026-11-18
+  Bugfixes:
+    - The "+1 building" checks after a solve no longer freeze the game (tens of seconds on a big
+      factory at "99%"): they run a little per tick with their own progress line
+---------------------------------------------------------------------------------------------------
+Version: 0.1.10
+Date: 2026-11-18
+  Changes:
+    - The shortcut button (and ALT+B) opens the window as you left it, or closes it; targets are
+      remembered and rescanned automatically after a restart or mod update
+    - The selection tool is picked up from a button in the window (full view)
+    - Dragging adds targets and right-dragging removes them; there is no "replace" selection any more
+    - The reset button also clears all targets
+    - "Add consumers" is available in compact view too
+    - Recipe, module and beacon icons in the buildings pane can be smart-pipetted
+---------------------------------------------------------------------------------------------------
+Version: 0.1.9
+Date: 2026-11-18
+  Features:
+    - Right-click a limiting item: "What it takes" lists the fewest new buildings (which ones and how
+      many) that make 10%, 25%, 50% or twice as much more of it, solved only over its supply chain
+    - The plan also shows what those buildings do for your targets, what limits them next, and
+      which imported items it would use more of
+  Changes:
+    - "makes" on bottleneck rows names the building's main product and skips minor byproducts
+---------------------------------------------------------------------------------------------------
+Version: 0.1.8
+Date: 2026-11-18
+  Features:
+    - Planned changes count as done: ghosts are scanned, buildings marked for upgrade use their
+      upgrade target, pending module requests are applied (deconstruction was already skipped)
+    - Ghost buildings can be selected as targets
+---------------------------------------------------------------------------------------------------
+Version: 0.1.0
+Date: 2026-11-11
+  Features:
+    - Select target buildings; the whole surface is scanned and solved as one linear program
+    - Items may be overproduced by default; only shortages matter
+    - Power, fuel, heat, water and steam are always treated as unlimited
+    - Bottlenecks are detected from marginal values: buildings where one more speeds up the targets
+    - Bottlenecks under 10% of the strongest one's impact are hidden as noise
+    - Targets are listed first, then bottlenecks ranked by impact, then supporting buildings
+    - Limiting items section, per-item mode override (surplus / unlimited / must balance)
+    - Click a building to look at it in remote view
+    - Revised simplex with sparse LU factorization, run over several ticks with a progress display
