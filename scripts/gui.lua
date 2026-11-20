@@ -4,7 +4,7 @@ local detail = require("scripts.detail")
 
 local gui = {
     events = {},
-    ---@type { rescan: fun(player: LuaPlayer), reset: fun(player: LuaPlayer), remove_targets: fun(player: LuaPlayer, unit_numbers: integer[]), set_speed: fun(player: LuaPlayer, row_key: string, speed: number), add_consumers: fun(player: LuaPlayer, item: string), toggle_item: fun(player: LuaPlayer, node_id: string), pick_tool: fun(player: LuaPlayer) }
+    ---@type { rescan: fun(player: LuaPlayer), reset: fun(player: LuaPlayer), remove_targets: fun(player: LuaPlayer, unit_numbers: integer[]), restore_targets: fun(player: LuaPlayer, entities: LuaEntity[]), apply: fun(player: LuaPlayer, speeds: table<string, number>), set_speeds: fun(player: LuaPlayer, changes: table<string, number>), stop: fun(player: LuaPlayer), add_consumers: fun(player: LuaPlayer, type: string, name: string), toggle_item: fun(player: LuaPlayer, node_id: string), pick_tool: fun(player: LuaPlayer) }
     callbacks = {},
 }
 
@@ -18,8 +18,11 @@ local main_window_name = "bottleneck-calc-extreme_wnd_main"
 ---@field scan? BCE.Scan
 ---@field built? table being solved
 ---@field solved? table
+---@field scanned_targets? table<integer, LuaEntity> the targets the scan was made for; s.targets differing from it is a change waiting for Apply
+---@field stopped? true the player stopped the last solve; Refresh starts again
 ---@field result? BCE.Result
 ---@field detail_item? string node id of the item report shown under the targets
+---@field detail_missing? { type: string, name: string } picked for the report, but not on the surface
 ---@field jump? { ri: integer, i: integer } last building jumped to from the item report
 ---@field highlights? LuaRenderObject[] green boxes around the buildings jumped to
 ---@field overrides table<string, string>
@@ -33,6 +36,16 @@ local main_window_name = "bottleneck-calc-extreme_wnd_main"
 ---@field label_status LuaGuiElement
 ---@field table_items LuaGuiElement?
 ---@field table_targets LuaGuiElement
+---@field table_detail LuaGuiElement
+---@field button_stop LuaGuiElement
+---@field pane_items LuaGuiElement
+---@field pane_targets LuaGuiElement
+---@field pane_detail LuaGuiElement
+---@field flow_right LuaGuiElement
+---@field button_pick_tool LuaGuiElement?
+---@field button_add_consumers LuaGuiElement
+---@field label_add_consumers LuaGuiElement
+---@field targets_locked boolean? the targets were drawn read-only, for a solve in progress
 
 ---@param player LuaPlayer
 ---@return BCE.PlayerStorage
@@ -49,6 +62,46 @@ function gui.get_storage(player)
     s.targets = s.targets or {}
     s.speeds = s.speeds or {}
     return s
+end
+
+--- Target changes waiting for Apply: buildings added since the scan, and whether any were removed.
+---@param s BCE.PlayerStorage
+---@return integer added
+---@return boolean removed
+local function target_changes(s)
+    local scanned = s.scanned_targets or {}
+    local added = 0
+    for id in pairs(s.targets) do
+        if (not scanned[id]) then
+            added = added + 1
+        end
+    end
+    for id in pairs(scanned) do
+        if (not s.targets[id]) then
+            return added, true
+        end
+    end
+    return added, false
+end
+
+---@param s BCE.PlayerStorage
+---@return boolean
+local function targets_dirty(s)
+    local added, removed = target_changes(s)
+    return added > 0 or removed
+end
+
+--- How many of a target group's buildings are still targets (fewer: removed, waiting for Apply).
+---@param s BCE.PlayerStorage
+---@param row BCE.Row
+local function row_remaining(s, row)
+    local n = 0
+    for _, id in ipairs(row.entity_ids) do
+        if (s.targets[id]) then
+            n = n + 1
+        end
+    end
+    return n
 end
 
 ---@param player LuaPlayer
@@ -117,7 +170,11 @@ end
 
 ---@param e EventData.on_gui_click
 local function on_pick_tool_click(e)
-    gui.callbacks.pick_tool(game.get_player(e.player_index) --[[@as LuaPlayer]])
+    local player = game.get_player(e.player_index) --[[@as LuaPlayer]]
+    if (gui.get_storage(player).built) then
+        return -- hidden while solving; this is only a safeguard
+    end
+    gui.callbacks.pick_tool(player)
 end
 
 ---@param e EventData.on_gui_click
@@ -125,13 +182,43 @@ local function on_reset_button_click(e)
     gui.callbacks.reset(game.get_player(e.player_index) --[[@as LuaPlayer]])
 end
 
---- An item dropped on the "add consumers" slot: every building using it becomes a target.
+---@param e EventData.on_gui_click
+local function on_stop_button_click(e)
+    gui.callbacks.stop(game.get_player(e.player_index) --[[@as LuaPlayer]])
+end
+
+--- What a signal slot holds, if it is an item or a fluid (a ghost or an item in the cursor, or
+--- one picked). Virtual signals and the rest: nil.
+---@param value SignalID?
+---@return string? type "item" | "fluid"
+---@return string? name
+---@return string? quality
+local function signal_item(value)
+    if (not value or not value.name) then
+        return nil
+    end
+    local t = value.type or "item"
+    if (t ~= "item" and t ~= "fluid") then
+        return nil
+    end
+    local quality = value.quality
+    if (type(quality) == "table") then
+        quality = quality.name
+    end
+    return t, value.name, quality
+end
+
+--- An item or fluid dropped on the "add consumers" slot: every building using it becomes a target.
 ---@param e EventData.on_gui_elem_changed
 local function on_consumers_elem_changed(e)
-    local item = e.element.elem_value --[[@as string?]]
+    local t, name = signal_item(e.element.elem_value --[[@as SignalID?]])
     e.element.elem_value = nil
-    if (item) then
-        gui.callbacks.add_consumers(game.get_player(e.player_index) --[[@as LuaPlayer]], item)
+    local player = game.get_player(e.player_index) --[[@as LuaPlayer]]
+    if (gui.get_storage(player).built) then
+        return -- hidden while solving; this is only a safeguard
+    end
+    if (t and name) then
+        gui.callbacks.add_consumers(player, t, name)
     end
 end
 
@@ -146,7 +233,9 @@ local function on_item_button_click(e)
     local player = game.get_player(e.player_index) --[[@as LuaPlayer]]
     if (e.button == defines.mouse_button_type.left) then
         gui.show_item_detail(player, node_id)
-    elseif (e.button == defines.mouse_button_type.right and e.element.tags.can_toggle) then
+    elseif (e.button == defines.mouse_button_type.right and e.element.tags.can_toggle
+        and not gui.get_storage(player).built) then
+        -- not while solving (the last results stay visible while a speed change is worked out)
         gui.callbacks.toggle_item(player, node_id)
     end
 end
@@ -157,12 +246,17 @@ local function on_building_button_click(e)
     local player = game.get_player(e.player_index) ---@cast player -nil
     local s = gui.get_storage(player)
     local key = e.element.tags.row_key --[[@as string?]]
-    if (not key or not s.scan or not e.element.tags.removable or e.button ~= defines.mouse_button_type.left) then
+    if (not key or not s.scan or s.built or not e.element.tags.removable or e.button ~= defines.mouse_button_type.left) then
         return
     end
+    -- waits for Apply; clicking a removed group again brings it back
     for _, r in ipairs(s.scan.rows) do
         if (r.key == key and r.is_target) then
-            gui.callbacks.remove_targets(player, r.entity_ids)
+            if (row_remaining(s, r) == 0) then
+                gui.callbacks.restore_targets(player, r.entities)
+            else
+                gui.callbacks.remove_targets(player, r.entity_ids)
+            end
             return
         end
     end
@@ -199,20 +293,17 @@ local function update_apply_button(s)
         return
     end
     local flow = tf.bce_apply_flow
-    local button = flow and flow.bce_apply_speeds
-    if (button and button.valid) then
-        button.enabled = s.pending_speeds ~= nil
+    if (not (flow and flow.valid)) then
+        return
     end
+    -- Apply and Undo go together, shown only while something waits (Undo is never disabled:
+    -- with nothing to undo, the two are hidden instead)
+    flow.visible = s.pending_speeds ~= nil or targets_dirty(s)
 end
 
---- A slider moved: show the Apply button.
+--- A slider moved: show the Apply button, or hide it if the slider went back.
 ---@param s BCE.PlayerStorage
 local function show_apply_button(s)
-    local tf = s.gui and s.gui.table_targets
-    local flow = tf and tf.valid and tf.bce_apply_flow
-    if (flow and flow.valid) then
-        flow.visible = true
-    end
     update_apply_button(s)
 end
 
@@ -222,6 +313,9 @@ end
 local function on_speed_changed(e)
     local player = game.get_player(e.player_index) ---@cast player -nil
     local s = gui.get_storage(player)
+    if (s.built) then
+        return -- the slider is disabled while solving; this is only a safeguard
+    end
     local key = e.element.tags.row_key --[[@as string]]
     local step = math.max(1, math.min(#SPEED_STEPS, math.floor(e.element.slider_value + 0.5)))
     local speed = SPEED_STEPS[step] / 100
@@ -240,16 +334,46 @@ local function on_speed_changed(e)
     show_apply_button(s)
 end
 
+--- Undo everything waiting for Apply: the sliders go back to the speeds worked out, and the
+--- targets to the ones scanned.
+---@param e EventData.on_gui_click
+local function on_undo_changes_click(e)
+    local player = game.get_player(e.player_index) ---@cast player -nil
+    local s = gui.get_storage(player)
+    if (s.built) then
+        return -- the button is hidden while solving; this is only a safeguard
+    end
+    s.pending_speeds = nil
+    local old = s.targets
+    s.targets = {}
+    for id, entity in pairs(s.scanned_targets or {}) do
+        -- (an older build kept only `true` here: then the entity still in the targets, if any).
+        -- A LuaEntity is userdata, not a table: test for the old `true` instead.
+        local ref = entity ~= true and entity or old[id]
+        if (ref and ref ~= true and ref.valid) then
+            s.targets[id] = ref
+        end
+    end
+    gui.refresh_targets(player)
+end
+
 --- Work out the report for the speeds chosen on the sliders.
 ---@param e EventData.on_gui_click
 local function on_apply_speeds_click(e)
     local player = game.get_player(e.player_index) ---@cast player -nil
     local s = gui.get_storage(player)
+    if (s.built) then
+        return -- the button is hidden while solving; this is only a safeguard
+    end
     local pending = s.pending_speeds
     s.pending_speeds = nil
     update_apply_button(s)
-    for key, speed in pairs(pending or {}) do
-        gui.callbacks.set_speed(player, key, speed)
+    if (targets_dirty(s)) then
+        -- other targets: scan again, with the new speeds
+        gui.callbacks.apply(player, pending or {})
+    elseif (pending) then
+        -- all at once: several separate calls would each start the solve over
+        gui.callbacks.set_speeds(player, pending)
     end
 end
 
@@ -288,12 +412,14 @@ flib_gui.add_handlers({
     on_close_button_click = on_close_button_click,
     on_rescan_button_click = on_rescan_button_click,
     on_reset_button_click = on_reset_button_click,
+    on_stop_button_click = on_stop_button_click,
     on_pick_tool_click = on_pick_tool_click,
     on_item_button_click = on_item_button_click,
     on_consumers_elem_changed = on_consumers_elem_changed,
     on_building_button_click = on_building_button_click,
     on_speed_changed = on_speed_changed,
     on_apply_speeds_click = on_apply_speeds_click,
+    on_undo_changes_click = on_undo_changes_click,
 }, nil, "bce")
 
 local function frame_action_button(name, sprite, tooltip, handler)
@@ -308,15 +434,28 @@ local function frame_action_button(name, sprite, tooltip, handler)
     }
 end
 
-local function pane(caption, content)
+--- A pane with a subheader; with a help key the caption gets an info icon whose tooltip explains it.
+---@param caption LocalisedString
+---@param content flib.GuiElemDef
+---@param help string?
+---@param name string the frame's name, to hide the pane while it is empty
+---@param fill boolean? stretch down to the bottom of the frame
+local function pane(caption, content, help, name, fill)
+    local label = { type = "label", style = "subheader_caption_label", caption = caption }
+    if (help) then
+        label.caption = { "", caption, " [img=info]" }
+        label.tooltip = { "gui.bottleneck-calc-extreme-help-" .. help }
+    end
     return {
         type = "frame",
+        name = name,
         style = "inside_shallow_frame",
         direction = "vertical",
+        visible = false,
         {
             type = "frame",
             style = "subheader_frame",
-            { type = "label", style = "subheader_caption_label", caption = caption },
+            label,
             { type = "empty-widget", style = "flib_horizontal_pusher" },
         },
         {
@@ -324,7 +463,8 @@ local function pane(caption, content)
             horizontal_scroll_policy = "never",
             vertical_scroll_policy = "auto-and-reserve-space",
             style = "flib_naked_scroll_pane",
-            style_mods = { top_padding = 8, bottom_padding = 8, horizontally_stretchable = true },
+            style_mods = { top_padding = 8, bottom_padding = 8, horizontally_stretchable = true,
+                vertically_stretchable = fill or nil },
             content
         }
     }
@@ -334,7 +474,8 @@ end
 ---@return BCE.GuiElements
 function gui.build(player)
     local s = gui.get_storage(player)
-    if (s.gui and s.gui.wnd_main.valid) then
+    -- label_add_consumers: a window from an older version of the mod gets rebuilt
+    if (s.gui and s.gui.wnd_main.valid and s.gui.label_add_consumers) then
         return s.gui
     end
     local existing = player.gui.screen[main_window_name]
@@ -353,11 +494,24 @@ function gui.build(player)
             caption = "",
             style_mods = { single_line = false, maximal_width = 900 },
         },
+        {
+            -- shown while a solve runs over the ticks: stops it (and the lag)
+            type = "sprite-button",
+            name = "button_stop",
+            style = "tool_button",
+            sprite = "virtual-signal/signal-deny",
+            tooltip = { "gui.bottleneck-calc-extreme-stop" },
+            visible = false,
+            style_mods = { left_margin = 8 },
+            mouse_button_filter = { "left" },
+            handler = { [defines.events.on_gui_click] = on_stop_button_click },
+        },
         { type = "empty-widget", style = "flib_horizontal_pusher" },
     }
     if (not compact) then
         status_flow[#status_flow + 1] = {
             type = "sprite-button",
+            name = "button_pick_tool",
             sprite = "item/bottleneck-calc-extreme-tool",
             tooltip = { "gui.bottleneck-calc-extreme-pick-tool" },
             style = "slot_button",
@@ -367,13 +521,16 @@ function gui.build(player)
     end
     status_flow[#status_flow + 1] = {
         type = "label",
+        name = "label_add_consumers",
         caption = { "gui.bottleneck-calc-extreme-add-consumers" },
         tooltip = { "gui.bottleneck-calc-extreme-add-consumers-tooltip" },
         style_mods = { left_margin = 16 },
     }
     status_flow[#status_flow + 1] = {
         type = "choose-elem-button",
-        elem_type = "item",
+        name = "button_add_consumers",
+        elem_type = "signal",
+        mouse_button_filter = { "left" },
         tooltip = { "gui.bottleneck-calc-extreme-add-consumers-tooltip" },
         handler = { [defines.events.on_gui_elem_changed] = on_consumers_elem_changed },
     }
@@ -388,13 +545,31 @@ function gui.build(player)
         name = "table_items",
         direction = "vertical",
         style_mods = { minimal_width = compact and 0 or 520, vertical_spacing = 0, left_padding = 8, right_padding = 8 },
-    })
-    panes[#panes + 1] = pane({ "gui.bottleneck-calc-extreme-pane-targets" }, {
+    }, nil, "pane_items")
+    -- right half: the targets, and under them the item report
+    local targets_pane = pane({ "gui.bottleneck-calc-extreme-pane-targets" }, {
         type = "flow",
         name = "table_targets",
         direction = "vertical",
         style_mods = { vertical_spacing = 4, left_padding = 8, right_padding = 8 },
-    })
+    }, "targets", "pane_targets")
+    targets_pane.style_mods = { horizontally_stretchable = true }
+    local detail_pane = pane({ "gui.bottleneck-calc-extreme-detail-title" }, {
+        type = "flow",
+        name = "table_detail",
+        direction = "vertical",
+        style_mods = { vertical_spacing = 4, left_padding = 8, right_padding = 8 },
+    }, "detail", "pane_detail", true)
+    detail_pane.style_mods = { horizontally_stretchable = true, vertically_stretchable = true }
+    panes[#panes + 1] = {
+        type = "flow",
+        name = "flow_right",
+        visible = false,
+        style = "inset_frame_container_vertical_flow",
+        direction = "vertical",
+        targets_pane,
+        detail_pane,
+    }
 
     local elems = flib_gui.add(player.gui.screen, {
         type = "frame",
@@ -455,6 +630,35 @@ function gui.build(player)
     return elems
 end
 
+local render_targets ---@type fun(player: LuaPlayer, s: BCE.PlayerStorage, ui: BCE.GuiElements)
+
+--- Panes show only when they have something in them; the stop button only while solving.
+---@param s BCE.PlayerStorage
+local function update_visibility(s)
+    local ui = s.gui
+    if (not (ui and ui.wnd_main.valid and ui.button_stop)) then
+        return
+    end
+    ui.button_stop.visible = s.built ~= nil
+    -- nothing that changes the targets while solving: cancel or wait first (Refresh and Reset
+    -- start over, so they stay)
+    if (ui.button_pick_tool) then
+        ui.button_pick_tool.visible = s.built == nil
+    end
+    ui.label_add_consumers.visible = s.built == nil
+    ui.button_add_consumers.visible = s.built == nil
+    ui.pane_items.visible = #ui.table_items.children > 0
+    -- the targets always show, read-only while solving. A solve can start without the targets
+    -- being drawn again (Apply continuing from the last answer): lock them then.
+    if ((s.built ~= nil) ~= (ui.targets_locked == true)) then
+        render_targets(game.get_player(ui.wnd_main.player_index) --[[@as LuaPlayer]], s, ui)
+    end
+    ui.pane_targets.visible = true
+    ui.flow_right.visible = true
+    -- the item report goes with the results, even when it only says to click an item
+    ui.pane_detail.visible = s.result ~= nil
+end
+
 ---@param player LuaPlayer
 ---@param caption LocalisedString
 function gui.show_progress(player, caption)
@@ -462,8 +666,11 @@ function gui.show_progress(player, caption)
     if (ui.table_items) then
         ui.table_items.clear()
     end
-    ui.table_targets.clear()
+    ui.table_detail.clear()
     ui.label_status.caption = caption
+    local s = gui.get_storage(player)
+    render_targets(player, s, ui)
+    update_visibility(s)
 end
 
 --- Only the status line: the last results stay visible while a new answer is worked out.
@@ -474,6 +681,7 @@ function gui.update_progress(player, caption)
     if (s.gui and s.gui.label_status.valid) then
         s.gui.label_status.caption = caption
     end
+    update_visibility(s)
 end
 
 -- ---------------------------------------------------------------------------
@@ -653,7 +861,8 @@ end
 
 ---@param row BCE.Row
 ---@param removable boolean click removes this target group
-local function cell_entity(row, removable)
+---@param removed boolean? every building of the group is removed, waiting for Apply: click restores
+local function cell_entity(row, removable, removed)
     local button = api.gui.gui_button(api.configuration.gui_entity(row.conf))
     local icon = create_icon_from_button(button, tostring(row.count_max))
     local b = icon[1]
@@ -663,7 +872,7 @@ local function cell_entity(row, removable)
             b.style = "flib_slot_button_default"
             b.style_mods = { size = 36 }
             b.tooltip = { "", button.tooltip or "", (button.tooltip and "\n" or ""),
-                { "gui.bottleneck-calc-extreme-click-to-remove" } }
+                { removed and "gui.bottleneck-calc-extreme-click-to-restore" or "gui.bottleneck-calc-extreme-click-to-remove" } }
             b.handler = { [defines.events.on_gui_click] = on_building_button_click }
         else
             b.tooltip = button.tooltip
@@ -709,7 +918,8 @@ end
 ---@param row BCE.Row
 ---@param speed number
 ---@param pending boolean speed chosen on the slider but not applied yet
-local function cell_speed(row, speed, pending)
+---@param locked boolean? a solve is running: the slider shows but can't be moved
+local function cell_speed(row, speed, pending, locked)
     local made = ""
     for _, a in ipairs(row.amounts) do
         if (a.amount > 0 and (a.node.type == "item" or a.node.type == "fluid")) then
@@ -732,6 +942,7 @@ local function cell_speed(row, speed, pending)
             discrete_values = true,
             tooltip = { "gui.bottleneck-calc-extreme-speed-tooltip" },
             tags = { row_key = row.key },
+            enabled = not locked,
             style_mods = { width = 120 },
             handler = { [defines.events.on_gui_value_changed] = on_speed_changed },
         },
@@ -1025,7 +1236,7 @@ local function status_caption(result, short, compact)
     return caption
 end
 
-local render_detail ---@type fun(parent: LuaGuiElement, s: BCE.PlayerStorage, result: BCE.Result)
+local render_detail ---@type fun(parent: LuaGuiElement, s: BCE.PlayerStorage, result: BCE.Result?)
 
 -- ---------------------------------------------------------------------------
 -- item report
@@ -1033,7 +1244,6 @@ local render_detail ---@type fun(parent: LuaGuiElement, s: BCE.PlayerStorage, re
 --- Rows listed per part of the report.
 local DETAIL_ROWS = 15
 
-local render_targets ---@type fun(player: LuaPlayer, s: BCE.PlayerStorage, ui: BCE.GuiElements, result: BCE.Result)
 
 ---@param e EventData.on_gui_click
 local function on_detail_item_click(e)
@@ -1053,6 +1263,20 @@ end
 local function on_detail_refresh_click(e)
     local player = game.get_player(e.player_index) --[[@as LuaPlayer]]
     gui.show_item_detail(player, gui.get_storage(player).detail_item)
+end
+
+--- An item or fluid dropped on (or picked in) the report's slot: show its report.
+---@param e EventData.on_gui_elem_changed
+local function on_detail_pick_changed(e)
+    local player = game.get_player(e.player_index) --[[@as LuaPlayer]]
+    local s = gui.get_storage(player)
+    local t, name, quality = signal_item(e.element.elem_value --[[@as SignalID?]])
+    if (not t or not name) then
+        gui.show_item_detail(player, s.detail_item, s.detail_missing) -- a virtual signal: put the slot back
+        return
+    end
+    local id = s.scan and s.result and detail.find_id(s.scan, s.result, t, name, quality)
+    gui.show_item_detail(player, id or nil, (not id) and { type = t, name = name } or nil)
 end
 
 --- How long the green boxes stay, in ticks.
@@ -1121,20 +1345,31 @@ flib_gui.add_handlers({
     on_detail_item_click = on_detail_item_click,
     on_detail_close_click = on_detail_close_click,
     on_detail_refresh_click = on_detail_refresh_click,
+    on_detail_pick_changed = on_detail_pick_changed,
 }, nil, "bce")
 
---- Show the report of an item under the targets (nil: close it).
+--- Draw the targets again after a change that waits for Apply.
+---@param player LuaPlayer
+function gui.refresh_targets(player)
+    local s = gui.get_storage(player)
+    if (s.gui and s.gui.wnd_main.valid and s.gui.button_add_consumers) then
+        render_targets(player, s, s.gui)
+        update_visibility(s)
+    end
+end
+
+--- Show the report of an item in its pane (nil: close it).
 ---@param player LuaPlayer
 ---@param id string?
-function gui.show_item_detail(player, id)
+---@param missing { type: string, name: string }? picked, but nothing on the surface makes or uses it
+function gui.show_item_detail(player, id, missing)
     local s = gui.get_storage(player)
     s.detail_item = id
-    if (not s.result or not s.gui or not s.gui.wnd_main.valid) then
+    s.detail_missing = missing
+    if (not s.result or not s.gui or not s.gui.wnd_main.valid or not s.gui.table_detail) then
         return
     end
-    local ui = s.gui
-    ui.table_targets.clear()
-    render_targets(player, s, ui, s.result)
+    render_detail(s.gui.table_detail, s, s.result)
 end
 
 --- Clickable item icon: opens that item's report.
@@ -1168,6 +1403,44 @@ local function detail_item_button(node, id, item)
         tags = { detail_id = id, bce_pipette = node_pipette(node) },
         handler = { [defines.events.on_gui_click] = on_detail_item_click },
     }
+end
+
+--- The slot at the top of the item report: shows the item or fluid, and takes another one (or a
+--- ghost) dropped on it or picked, like the "add consumers" slot.
+---@param value SignalID?
+---@param item BCE.Item?
+local function detail_picker(value, item)
+    local tip = { "" }
+    if (item and item.coverage) then
+        tip[#tip + 1] = { "gui.bottleneck-calc-extreme-detail-coverage", percent(item.coverage) }
+        tip[#tip + 1] = "\n"
+    end
+    tip[#tip + 1] = { value and "gui.bottleneck-calc-extreme-detail-pick-another" or "gui.bottleneck-calc-extreme-detail-pick" }
+    return {
+        type = "choose-elem-button",
+        elem_type = "signal",
+        mouse_button_filter = { "left" },
+        style = "flib_slot_button_default",
+        style_mods = { size = 32 },
+        tooltip = tip,
+        tags = { bce_pipette = value and { type = value.type, name = value.name } or nil },
+        elem_mods = { elem_value = value },
+        handler = { [defines.events.on_gui_elem_changed] = on_detail_pick_changed },
+    }
+end
+
+--- The slot's value for a report's node: items and fluids (a temperature range shows its fluid).
+---@param node Rates.Node
+---@return SignalID?
+local function node_signal(node)
+    if (node.type == "item") then
+        return { type = "item", name = node.item.name, quality = node.quality.name }
+    elseif (node.type == "fluid") then
+        return { type = "fluid", name = node.fluid.name }
+    elseif (node.type == "any" and node.details and node.details.type == "any-fluid" and node.details.fluid) then
+        return { type = "fluid", name = node.details.fluid.name }
+    end
+    return nil
 end
 
 ---@param coverage number?
@@ -1283,11 +1556,18 @@ end
 ---@param s BCE.PlayerStorage
 ---@param result BCE.Result
 render_detail = function(parent, s, result)
-    if (not s.detail_item or not s.scan) then
-        return
-    end
-    local d = detail.build(s.scan, result, s.detail_item)
+    parent.clear()
+    local d = s.detail_item and s.scan and result and detail.build(s.scan, result, s.detail_item)
     if (not d) then
+        -- nothing picked, or something no building on this surface makes or uses
+        local missing = s.detail_missing
+        local proto = missing and prototypes and prototypes[missing.type] and prototypes[missing.type][missing.name]
+        local value = proto and { type = missing.type, name = missing.name } or nil
+        flib_gui.add(parent, { type = "flow", direction = "horizontal", style_mods = { vertical_align = "center" },
+            detail_picker(value, nil),
+            { type = "label", style_mods = { font_color = { 0.6, 0.6, 0.6 }, single_line = false, maximal_width = 400, left_margin = 8 },
+                caption = value and { "gui.bottleneck-calc-extreme-detail-not-found", proto.localised_name }
+                    or { "gui.bottleneck-calc-extreme-detail-empty" } } })
         return
     end
     local items = {} ---@type table<string, BCE.Item>
@@ -1299,12 +1579,31 @@ render_detail = function(parent, s, result)
         return api.gui.gui_amount_text(ui, x)
     end
 
-    flib_gui.add(parent, {
-        type = "flow",
-        direction = "horizontal",
-        style_mods = { vertical_align = "center", top_margin = 12 },
-        header_def({ "gui.bottleneck-calc-extreme-detail-title" }, "detail"),
-        { type = "empty-widget", style = "flib_horizontal_pusher" },
+    local item = d.item
+    local summary = { type = "flow", direction = "horizontal", style_mods = { vertical_align = "center" } }
+    local signal = node_signal(d.node)
+    if (signal) then
+        summary[#summary + 1] = detail_picker(signal, item)
+    else
+        -- heat and such: its icon, and an empty slot to pick something else
+        local icon = detail_item_button(d.node, d.id, item)
+        icon.handler, icon.tags.detail_id = nil, nil
+        icon.tooltip = item and item.coverage and { "gui.bottleneck-calc-extreme-detail-coverage", percent(item.coverage) } or nil
+        summary[#summary + 1] = icon
+        summary[#summary + 1] = detail_picker(nil, nil)
+    end
+    summary[#summary + 1] =
+        { type = "label", caption = api.gui.gui_button_and_text(ui, nil).text, style = "bold_label", style_mods = { left_margin = 4 } }
+    if (item) then
+        if (not s.is_pinned) then
+            summary[#summary + 1] = { type = "label", style_mods = { left_margin = 12 },
+                caption = { "gui.bottleneck-calc-extreme-detail-summary", amt(item.needed), amt(item.capacity) } }
+        end
+        summary[#summary + 1] = { type = "label", caption = difference_caption(item.capacity, item.needed, amt),
+            style_mods = { left_margin = 8 } }
+    end
+    summary[#summary + 1] = { type = "empty-widget", style = "flib_horizontal_pusher" }
+    for _, button in ipairs({
         {
             type = "sprite-button",
             style = "tool_button",
@@ -1319,18 +1618,8 @@ render_detail = function(parent, s, result)
             tooltip = { "gui.bottleneck-calc-extreme-detail-close" },
             handler = { [defines.events.on_gui_click] = on_detail_close_click },
         },
-    })
-    local item = d.item
-    local summary = { type = "flow", direction = "horizontal", style_mods = { vertical_align = "center" },
-        detail_item_button(d.node, d.id, item),
-        { type = "label", caption = api.gui.gui_button_and_text(ui, nil).text, style = "bold_label", style_mods = { left_margin = 4 } } }
-    if (item) then
-        if (not s.is_pinned) then
-            summary[#summary + 1] = { type = "label", style_mods = { left_margin = 12 },
-                caption = { "gui.bottleneck-calc-extreme-detail-summary", amt(item.needed), amt(item.capacity) } }
-        end
-        summary[#summary + 1] = { type = "label", caption = difference_caption(item.capacity, item.needed, amt),
-            style_mods = { left_margin = 8 } }
+    }) do
+        summary[#summary + 1] = button
     end
     flib_gui.add(parent, summary)
     local compact = s.is_pinned == true
@@ -1507,56 +1796,87 @@ end
 ---@param player LuaPlayer
 ---@param s BCE.PlayerStorage
 ---@param ui BCE.GuiElements
----@param result BCE.Result
-render_targets = function(player, s, ui, result)
-    -- targets and their speeds
+render_targets = function(player, s, ui)
+    -- targets and their speeds, from the scan: they show while solving and after a stop too.
+    -- While solving they are read-only: cancel or wait to change them, so nothing changes under
+    -- the solver.
+    local locked = s.built ~= nil
+    ui.targets_locked = locked
     local tf = ui.table_targets
-    flib_gui.add(tf, header_def({ "gui.bottleneck-calc-extreme-targets" }, "targets"))
+    tf.clear()
+    local targets = {}
+    for _, row in ipairs(s.scan and s.scan.rows or {}) do
+        if (row.is_target) then
+            targets[#targets + 1] = { row = row }
+        end
+    end
+    if (#targets == 0) then
+        flib_gui.add(tf, { type = "label", caption = { "gui.bottleneck-calc-extreme-no-targets" },
+            style_mods = { font_color = { 0.6, 0.6, 0.6 } } })
+        return
+    end
     local tb = tf.add({ type = "table", column_count = 5 })
     tb.style.vertical_spacing = 0
     tb.style.column_alignments[1] = "right"
-    local targets = {}
-    for _, t in ipairs(result.targets) do
-        targets[#targets + 1] = t
-    end
     table.sort(targets, function(a, b) return a.row.key < b.row.key end)
     local compact = s.is_pinned == true
     local pending = s.pending_speeds or {}
     for _, t in ipairs(targets) do
+        -- removals wait for Apply: the count shows what is left, yellow when it changed
+        local remaining = row_remaining(s, t.row)
+        local count_caption = tostring(remaining) .. " × "
+        if (remaining ~= t.row.count_max) then
+            count_caption = "[color=yellow]" .. count_caption .. "[/color]"
+        end
         local speed_cell
         if (compact) then
             -- no slider: the speed the numbers were worked out for
             speed_cell = cell_speed(t.row, s.speeds[t.row.key] or 1, false)
             table.remove(speed_cell, 1)
         else
-            speed_cell = cell_speed(t.row, pending[t.row.key] or s.speeds[t.row.key] or 1, pending[t.row.key] ~= nil)
+            speed_cell = cell_speed(t.row, pending[t.row.key] or s.speeds[t.row.key] or 1, pending[t.row.key] ~= nil, locked)
         end
         flib_gui.add(tb, {
-            { type = "label", caption = tostring(t.row.count_max) .. " × ", style_mods = { font = "item-count" } },
+            { type = "label", caption = count_caption, style_mods = { font = "item-count" } },
             cell_annotations(t.row),
             create_node_icon(api.configuration.gui_recipe(t.row.conf), nil, recipe_pipette(t.row.conf)),
-            cell_entity(t.row, #targets > 1),
+            cell_entity(t.row, not locked, remaining == 0),
             speed_cell,
         })
     end
-    if (not compact) then flib_gui.add(tf, {
+    -- the compact view has no sliders, but targets can be removed there too
+    local added = target_changes(s)
+    local waiting = (s.pending_speeds ~= nil or targets_dirty(s)) and not locked
+    flib_gui.add(tf, {
         type = "flow",
         name = "bce_apply_flow",
-        -- shown once a slider moves; after the answer is worked out it would only be clutter
-        visible = s.pending_speeds ~= nil,
-        style_mods = { horizontal_align = "right", horizontally_stretchable = true, top_margin = 4 },
+        -- shown once something waits for it; after the answer is worked out it would only be clutter
+        visible = waiting,
+        style_mods = { vertical_align = "center", horizontally_stretchable = true, top_margin = 4 },
+        {
+            type = "label",
+            caption = added > 0 and { "gui.bottleneck-calc-extreme-targets-to-add", tostring(added) } or "",
+            style_mods = { font_color = { 1, 1, 0 } },
+        },
+        { type = "empty-widget", style = "flib_horizontal_pusher" },
+        {
+            type = "sprite-button",
+            name = "bce_undo_changes",
+            style = "tool_button",
+            sprite = "utility/reset",
+            tooltip = { "gui.bottleneck-calc-extreme-undo-changes" },
+            style_mods = { right_margin = 4 },
+            mouse_button_filter = { "left" },
+            handler = { [defines.events.on_gui_click] = on_undo_changes_click },
+        },
         {
             type = "button",
             name = "bce_apply_speeds",
             caption = { "gui.bottleneck-calc-extreme-apply-speeds" },
             tooltip = { "gui.bottleneck-calc-extreme-apply-speeds-tooltip" },
-            enabled = s.pending_speeds ~= nil,
             handler = { [defines.events.on_gui_click] = on_apply_speeds_click },
         },
-    }) end
-
-
-    render_detail(ui.table_targets, s, result)
+    })
 end
 
 ---@param player LuaPlayer
@@ -1568,7 +1888,6 @@ function gui.render(player, result)
     if (ui.table_items) then
         ui.table_items.clear()
     end
-    ui.table_targets.clear()
     local max_rows = settings.get_player_settings(player)["bottleneck-calc-extreme-max-rows"].value --[[@as integer]]
 
     local short, enough, inputs, unlimited = {}, {}, {}, {}
@@ -1602,16 +1921,19 @@ function gui.render(player, result)
 
     ui.label_status.caption = status_caption(result, short, compact)
 
-    render_targets(player, s, ui, result)
+    render_targets(player, s, ui)
+    render_detail(ui.table_detail, s, result)
 
     local ti = ui.table_items
     if (not ti) then
+        update_visibility(s)
         return
     end
     item_section(ti, { "gui.bottleneck-calc-extreme-short", tostring(#short) }, "short", short, max_rows, "short", compact)
     item_section(ti, { "gui.bottleneck-calc-extreme-enough", tostring(#enough) }, "enough", enough, max_rows, "enough", compact)
     item_section(ti, { "gui.bottleneck-calc-extreme-inputs" }, "inputs", inputs, max_rows, "used", compact)
     item_section(ti, { "gui.bottleneck-calc-extreme-unlimited" }, "unlimited", unlimited, max_rows, "used", compact)
+    update_visibility(s)
 end
 
 return gui

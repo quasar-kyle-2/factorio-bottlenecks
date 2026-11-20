@@ -1,5 +1,6 @@
 local gui = require("scripts.gui")
 local model = require("scripts.model")
+local detail = require("scripts.detail")
 local lp = require("scripts.lp")
 local handler = require("__core__.lualib.event_handler")
 local flib_gui = require("__flib__.gui")
@@ -36,6 +37,7 @@ local function start_solve(player)
     if (not s.scan) then
         return
     end
+    s.stopped = nil
     local built = model.build(s.scan, s.overrides, setting(player, "track-steam") --[[@as boolean]], s.speeds)
     s.built = built
     s.solved = nil
@@ -51,6 +53,7 @@ end
 ---@param player LuaPlayer
 local function run_scan(player)
     local s = gui.get_storage(player)
+    s.stopped = nil
     local surface = s.surface_index and game.get_surface(s.surface_index)
     if (not surface) then
         return
@@ -68,33 +71,86 @@ local function run_scan(player)
     end
     if (not any) then
         -- clean slate: an empty window, ready for "add consumers"
-        s.scan, s.built, s.solved, s.result = nil, nil, nil, nil
+        s.scan, s.built, s.solved, s.result, s.scanned_targets = nil, nil, nil, nil, nil
         gui.show_progress(player, { "gui.bottleneck-calc-extreme-empty" })
         return
     end
 
     s.scan = model.scan(surface, player.force --[[@as LuaForce]], target_ids,
         setting(player, "use-analyzer") --[[@as boolean]])
+    -- with the entities, so Undo can put back removed ones
+    local scanned = {} ---@type table<integer, LuaEntity>
+    for id in pairs(target_ids) do
+        scanned[id] = s.targets[id]
+    end
+    s.scanned_targets = scanned
     start_solve(player)
 end
 
 gui.callbacks.rescan = run_scan
+
+--- Whether the last scan had targets. Then target changes wait for Apply, so several can be
+--- made before the (slow) scan and analysis; on a clean slate they start it right away.
+---@param s BCE.PlayerStorage
+local function has_applied_targets(s)
+    return s.scan ~= nil and s.scanned_targets ~= nil and next(s.scanned_targets) ~= nil
+end
+
+local show_window ---@type fun(player: LuaPlayer)
+
+--- Targets changed: wait for Apply when there were targets before, otherwise scan now.
+---@param player LuaPlayer
+local function targets_changed(player)
+    if (has_applied_targets(gui.get_storage(player))) then
+        show_window(player)
+    else
+        run_scan(player)
+    end
+end
 
 gui.callbacks.remove_targets = function(player, unit_numbers)
     local s = gui.get_storage(player)
     for _, unit_number in ipairs(unit_numbers) do
         s.targets[unit_number] = nil
     end
+    targets_changed(player)
+end
+
+--- A removed target group clicked again: back in, still waiting for Apply.
+gui.callbacks.restore_targets = function(player, entities)
+    local s = gui.get_storage(player)
+    for _, entity in ipairs(entities) do
+        if (entity.valid and entity.unit_number) then
+            s.targets[entity.unit_number] = entity
+        end
+    end
+    targets_changed(player)
+end
+
+--- Apply with target changes: the new speeds, then scan the new targets and work them out.
+gui.callbacks.apply = function(player, speeds)
+    local s = gui.get_storage(player)
+    for row_key, speed in pairs(speeds) do
+        s.speeds[row_key] = (math.abs(speed - 1) > 1e-9) and speed or nil
+    end
     run_scan(player)
 end
 
---- A target group's speed changed: continue from the last answer when possible.
-gui.callbacks.set_speed = function(player, row_key, speed)
+--- Target groups' speeds changed (Apply): continue from the last answer when possible, which
+--- only a finished one is. After a cancel there is none, so it starts over. (The targets are
+--- read-only while solving, so this never runs during one.)
+gui.callbacks.set_speeds = function(player, changes)
     local s = gui.get_storage(player)
-    s.speeds[row_key] = (math.abs(speed - 1) > 1e-9) and speed or nil
-    local built = s.built or s.solved
-    if (built and s.scan and model.set_speed(built, s.scan, row_key, speed)) then
+    local built = (not s.built) and s.solved or nil
+    local warm = built ~= nil and s.scan ~= nil
+    for row_key, speed in pairs(changes) do
+        s.speeds[row_key] = (math.abs(speed - 1) > 1e-9) and speed or nil
+        -- once one can't continue, the rest needn't try: start_solve builds from scratch
+        warm = warm and model.set_speed(built, s.scan, row_key, speed)
+    end
+    if (warm) then
         built.warm = true
+        s.stopped = nil
         s.built = built
         s.solved = nil
         gui.update_progress(player, progress_caption(built))
@@ -103,29 +159,30 @@ gui.callbacks.set_speed = function(player, row_key, speed)
     end
 end
 
-gui.callbacks.add_consumers = function(player, item)
+gui.callbacks.add_consumers = function(player, type, name)
     local s = gui.get_storage(player)
+    if (s.built) then
+        return
+    end
     local surface = s.surface_index and game.get_surface(s.surface_index)
     if (not surface) then
         return
     end
-    -- With targets, only buildings that feed them count (an aerial caravan using brains does
-    -- not matter for research). On a clean slate every consumer counts.
-    local chain = (s.result and next(s.targets)) and s.result.chain_units or nil
+    -- Every building on the surface that uses it, whatever the targets or the last results are:
+    -- the same every time. Ones that don't matter can be clicked off before Apply.
     if (not s.scan) then
         s.scan = model.scan(surface, player.force --[[@as LuaForce]], {}, setting(player, "use-analyzer") --[[@as boolean]])
     end
-    local added, skipped = 0, 0
+    local found, added = 0, 0
     for _, row in ipairs(s.scan.rows) do
         for _, a in ipairs(row.amounts) do
-            if (a.amount < 0 and a.node.type == "item" and a.node.item.name == item) then
+            if (a.amount < 0 and detail.node_is(a.node, type, name)) then
                 -- the scan keeps entity references: game.get_entity_by_unit_number only
                 -- finds a few entity types, not assemblers
                 for _, entity in ipairs(row.entities or {}) do
                     if (entity.valid and entity.unit_number) then
-                        if (chain and not chain[entity.unit_number]) then
-                            skipped = skipped + 1
-                        else
+                        found = found + 1
+                        if (not s.targets[entity.unit_number]) then
                             s.targets[entity.unit_number] = entity
                             added = added + 1
                         end
@@ -135,15 +192,28 @@ gui.callbacks.add_consumers = function(player, item)
             end
         end
     end
-    if (skipped > 0) then
-        player.print({ "gui.bottleneck-calc-extreme-consumers-skipped", tostring(skipped), "[item=" .. item .. "]" })
-    end
-    if (added == 0) then
-        player.print({ chain and "gui.bottleneck-calc-extreme-no-chain-consumers" or "gui.bottleneck-calc-extreme-no-consumers",
-            "[item=" .. item .. "]" })
+    if (found == 0) then
+        player.print({ "gui.bottleneck-calc-extreme-no-consumers", "[" .. type .. "=" .. name .. "]" })
         return
     end
-    run_scan(player)
+    if (added == 0) then
+        return -- all of them are targets already
+    end
+    targets_changed(player)
+end
+
+--- The stop button: drop the solve in progress (and its lag). The last results go too, since
+--- they no longer match the targets or speeds; the targets, speeds and unlimited items stay, and
+--- Refresh starts again. Remembered, so opening the window again does not restart it either.
+gui.callbacks.stop = function(player)
+    local s = gui.get_storage(player)
+    if (not s.built) then
+        return
+    end
+    -- pending speeds stay: the targets still show, with their Apply button
+    s.built, s.solved, s.result = nil, nil, nil
+    s.stopped = true
+    gui.show_progress(player, { "gui.bottleneck-calc-extreme-stopped" })
 end
 
 gui.callbacks.reset = function(player)
@@ -165,12 +235,14 @@ end
 --- Shows the window as it was left: the last results, a running solve, or (after a restart or a
 --- mod update, when only the targets are remembered) a fresh scan of them.
 ---@param player LuaPlayer
-local function show_window(player)
+show_window = function(player)
     local s = gui.get_storage(player)
     if (s.built) then
         gui.show_progress(player, progress_caption(s.built))
     elseif (s.result) then
         gui.render(player, s.result)
+    elseif (s.stopped) then
+        gui.show_progress(player, { "gui.bottleneck-calc-extreme-stopped" })
     else
         s.surface_index = s.surface_index or player.surface.index
         run_scan(player)
@@ -211,16 +283,22 @@ local function on_player_selected_area(e)
     end
     local player = game.get_player(e.player_index) ---@cast player -nil
     local s = gui.get_storage(player)
+    if (s.built) then
+        -- the targets can't change while solving: cancel or wait first
+        player.create_local_flying_text({ text = { "gui.bottleneck-calc-extreme-busy" }, create_at_cursor = true })
+        return
+    end
     local remove = e.name == defines.events.on_player_reverse_selected_area
         or e.name == defines.events.on_player_alt_reverse_selected_area
 
     -- targets live on one surface: selecting on another one starts over there
-    local changed = false
+    local changed, switched = false, false
     if (s.surface_index ~= e.surface.index) then
         if (remove) then
             return
         end
         changed = next(s.targets) ~= nil
+        switched = true
         s.targets = {}
         s.speeds = {}
         s.pending_speeds = nil
@@ -240,8 +318,10 @@ local function on_player_selected_area(e)
         end
     end
 
-    if (changed) then
-        run_scan(player)
+    if (changed and switched) then
+        run_scan(player) -- another surface: starting over
+    elseif (changed) then
+        targets_changed(player)
     else
         show_window(player)
     end
@@ -407,6 +487,8 @@ script.on_configuration_changed(function()
         -- scans hold prototypes and node ids that may be stale after mod changes
         for _, s in pairs(storage.players) do
             s.scan, s.built, s.solved, s.result, s.gui = nil, nil, nil, nil, nil
+            -- without a scan a stopped window would show no targets: scan again on open
+            s.stopped = nil
             -- left over from 0.1.x
             s.plan, s.tplan, s.refine, s.must_run, s.pending_must = nil, nil, nil, nil, nil
             -- "unlimited" is the only item override left ("free" was its old name)

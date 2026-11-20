@@ -35,6 +35,62 @@ local function node_name(node)
     return nil, nil
 end
 
+--- Whether a node is this item or fluid. A fluid matches at any temperature, and so does a fluid
+--- ingredient's temperature range ("any" node).
+---@param node Rates.Node
+---@param type string "item" | "fluid"
+---@param name string
+---@return boolean
+function detail.node_is(node, type, name)
+    if (node.type == "item") then
+        return type == "item" and node.item.name == name
+    elseif (node.type == "fluid") then
+        return type == "fluid" and node.fluid.name == name
+    elseif (node.type == "any") then
+        local d = node.details
+        return type == "fluid" and d ~= nil and d.type == "any-fluid" and d.fluid ~= nil and d.fluid.name == name
+    end
+    return false
+end
+
+--- The report id for an item or fluid picked by name: the item in that quality first (any
+--- quality otherwise), a fluid itself before a temperature range. nil: nothing on the surface
+--- makes or uses it.
+---@param scan BCE.Scan
+---@param result BCE.Result
+---@param type string "item" | "fluid"
+---@param name string
+---@param quality string?
+---@return string?
+function detail.find_id(scan, result, type, name, quality)
+    quality = quality or "normal"
+    local best, best_score
+    local function consider(id, node)
+        if (not detail.node_is(node, type, name)) then
+            return
+        end
+        local score = 0
+        if ((node.type == "item" and node.quality.name == quality) or node.type == "fluid") then
+            score = 1
+        end
+        if (not best or score > best_score) then
+            best, best_score = id, score
+        end
+    end
+    for _, e in ipairs(result.items) do
+        consider(e.id, e.node)
+    end
+    if (best) then
+        return best
+    end
+    for _, row in ipairs(scan.rows) do
+        for _, a in ipairs(row.amounts) do
+            consider(a.id, a.node)
+        end
+    end
+    return best
+end
+
 local status_name = {} ---@type table<integer, string>
 for name, value in pairs(defines.entity_status) do
     status_name[value] = name

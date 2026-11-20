@@ -1,23 +1,44 @@
 ---------------------------------------------------------------------------------------------------
-Version: 0.2.1
-Date: 2026-11-19
+Version: 0.2.2
+Date: 2026-11-20
   Features:
-    - Item report: click an item for where it goes and where it comes from, under the
-      targets. Every building using it (and how many of them are waiting for it right now), every
+    - Item report: click an item for where it goes and where it comes from, in its own pane under
+      the targets. Every building using it (and how many of them are waiting for it right now), every
       building making it (what else it makes, which of its own inputs are short, what it is doing
       now), and what the item mostly becomes on the way to your targets. Click any item icon in
       the report for that item's report
+    - Item report: the slot at the top takes an item or fluid (or its ghost) dropped on it, or click
+      it to pick one, and shows that report. With nothing shown, the slot is there to start one
+    - "Add consumers" takes fluids and ghosts too
     - Item report: "Goes to" shows what each building makes with the item, shortest first, and the
       way to your targets follows a short product where there is one (that is what the building is
       pushed for)
     - Click a building icon in the item report to show those buildings on the map (each click the
       next one), with green boxes around all of them for 12 seconds
+    - A stop button next to the progress cancels the analysis (and the lag). The targets, speeds
+      and unlimited items stay; Refresh starts again
   Changes:
     - Compact (pinned) view: shows the Items pane with only the difference column (20 short items,
       then how many more; Enough as two counts: balanced and surplus), "Add consumers", the targets'
       speeds without sliders, and a slimmer item report (just the difference at the top, no live
       status, only short products, one difference column for what buildings make, a narrower path)
     - The rescan button says "Refresh" next to its icon
+    - The Targets pane no longer repeats "Targets" inside it: its info icon is in the pane title
+    - The mod's icon is sky blue instead of dark blue
+    - The Items and Item report panes are hidden while there are no results
+    - The targets show while working it out (read-only until it finishes or is cancelled) and
+      after a cancel, so they can be removed or their speeds changed without waiting for it
+    - Removing targets, or adding to the ones there are, waits for Apply instead of scanning and
+      working it out right away, so several changes cost one analysis. Removed groups show 0 in
+      yellow (click again to bring them back); added buildings show as "+N buildings to add".
+      The first targets on a clean slate still start right away. The button left of Apply undoes
+      all of it (speeds too)
+    - Add consumers always adds every building on the surface that uses the item, whatever the
+      targets are. It used to skip the ones that don't feed the targets, which depended on the
+      last results (none after a cancel, out of date while target changes wait for Apply)
+    - While working it out, the selection tool button and Add consumers are hidden, and dragging
+      the selection tool or right-clicking an item for unlimited does nothing: cancel or wait
+      first. Refresh and Reset still start over
     - Item report: the difference replaces the coverage at the top
     - Ash is no longer hard-coded as unlimited: any item a fuel leaves behind when burnt, that no
       recipe refills one for one into that fuel, counts as waste (ash, spent nuclear fuel cells).
