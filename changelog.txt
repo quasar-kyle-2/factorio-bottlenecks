@@ -82,7 +82,6 @@ Date: 2026-11-19
   Changes:
     - Ash is treated as unlimited, like water: getting rid of it isn't a real use
     - Removed: bottlenecks, limiting items, must-run targets, build plans and "what it takes"
-      (0.1.14 is kept in Factorio/mod-archive)
     - Clicking an item switches it between counted and unlimited
 ---------------------------------------------------------------------------------------------------
 Version: 0.1.14
