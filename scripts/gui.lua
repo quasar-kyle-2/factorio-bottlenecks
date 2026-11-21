@@ -23,6 +23,7 @@ local main_window_name = "bottleneck-calc-extreme_wnd_main"
 ---@field result? BCE.Result
 ---@field detail_item? string node id of the item report shown under the targets
 ---@field detail_missing? { type: string, name: string } picked for the report, but not on the surface
+---@field detail_history? { list: { id: string?, missing: { type: string, name: string }? }[], pos: integer } reports viewed, for back and forward
 ---@field jump? { ri: integer, i: integer } last building jumped to from the item report
 ---@field highlights? LuaRenderObject[] green boxes around the buildings jumped to
 ---@field overrides table<string, string>
@@ -37,6 +38,11 @@ local main_window_name = "bottleneck-calc-extreme_wnd_main"
 ---@field table_items LuaGuiElement?
 ---@field table_targets LuaGuiElement
 ---@field table_detail LuaGuiElement
+---@field scroll_detail LuaGuiElement?
+---@field button_detail_back LuaGuiElement?
+---@field button_detail_forward LuaGuiElement?
+---@field button_detail_refresh LuaGuiElement?
+---@field button_detail_close LuaGuiElement?
 ---@field button_stop LuaGuiElement
 ---@field pane_items LuaGuiElement
 ---@field pane_targets LuaGuiElement
@@ -434,17 +440,30 @@ local function frame_action_button(name, sprite, tooltip, handler)
     }
 end
 
+local on_detail_back_click, on_detail_forward_click, on_detail_refresh_click, on_detail_close_click
+
 --- A pane with a subheader; with a help key the caption gets an info icon whose tooltip explains it.
 ---@param caption LocalisedString
 ---@param content flib.GuiElemDef
 ---@param help string?
 ---@param name string the frame's name, to hide the pane while it is empty
 ---@param fill boolean? stretch down to the bottom of the frame
-local function pane(caption, content, help, name, fill)
+---@param buttons flib.GuiElemDef[]? right aligned in the subheader
+---@param scroll_name string? name of the scroll-pane, to change it later
+local function pane(caption, content, help, name, fill, buttons, scroll_name)
     local label = { type = "label", style = "subheader_caption_label", caption = caption }
     if (help) then
         label.caption = { "", caption, " [img=info]" }
         label.tooltip = { "gui.bottleneck-calc-extreme-help-" .. help }
+    end
+    local subheader = {
+        type = "frame",
+        style = "subheader_frame",
+        label,
+        { type = "empty-widget", style = "flib_horizontal_pusher" },
+    }
+    for _, b in ipairs(buttons or {}) do
+        subheader[#subheader + 1] = b
     end
     return {
         type = "frame",
@@ -452,15 +471,11 @@ local function pane(caption, content, help, name, fill)
         style = "inside_shallow_frame",
         direction = "vertical",
         visible = false,
-        {
-            type = "frame",
-            style = "subheader_frame",
-            label,
-            { type = "empty-widget", style = "flib_horizontal_pusher" },
-        },
+        subheader,
         {
             type = "scroll-pane",
-            horizontal_scroll_policy = "never",
+            name = scroll_name,
+            horizontal_scroll_policy = scroll_name and "auto" or "never",
             vertical_scroll_policy = "auto-and-reserve-space",
             style = "flib_naked_scroll_pane",
             style_mods = { top_padding = 8, bottom_padding = 8, horizontally_stretchable = true,
@@ -474,8 +489,8 @@ end
 ---@return BCE.GuiElements
 function gui.build(player)
     local s = gui.get_storage(player)
-    -- label_add_consumers: a window from an older version of the mod gets rebuilt
-    if (s.gui and s.gui.wnd_main.valid and s.gui.label_add_consumers) then
+    -- button_detail_close: a window from an older version of the mod gets rebuilt
+    if (s.gui and s.gui.wnd_main.valid and s.gui.button_detail_close) then
         return s.gui
     end
     local existing = player.gui.screen[main_window_name]
@@ -488,6 +503,15 @@ function gui.build(player)
         type = "flow",
         direction = "horizontal",
         style_mods = { vertical_align = "center" },
+        {
+            type = "sprite-button",
+            name = "button_pick_tool",
+            sprite = "item/bottleneck-calc-extreme-tool",
+            tooltip = { "gui.bottleneck-calc-extreme-pick-tool" },
+            style = "slot_button",
+            style_mods = { right_margin = 8 },
+            handler = { [defines.events.on_gui_click] = on_pick_tool_click },
+        },
         {
             type = "label",
             name = "label_status",
@@ -508,17 +532,6 @@ function gui.build(player)
         },
         { type = "empty-widget", style = "flib_horizontal_pusher" },
     }
-    if (not compact) then
-        status_flow[#status_flow + 1] = {
-            type = "sprite-button",
-            name = "button_pick_tool",
-            sprite = "item/bottleneck-calc-extreme-tool",
-            tooltip = { "gui.bottleneck-calc-extreme-pick-tool" },
-            style = "slot_button",
-            style_mods = { left_margin = 16 },
-            handler = { [defines.events.on_gui_click] = on_pick_tool_click },
-        }
-    end
     status_flow[#status_flow + 1] = {
         type = "label",
         name = "label_add_consumers",
@@ -559,7 +572,50 @@ function gui.build(player)
         name = "table_detail",
         direction = "vertical",
         style_mods = { vertical_spacing = 4, left_padding = 8, right_padding = 8 },
-    }, "detail", "pane_detail", true)
+    }, "detail", "pane_detail", true, {
+        {
+            type = "sprite-button",
+            name = "button_detail_refresh",
+            style = "frame_action_button",
+            sprite = "bottleneck-calc-extreme-refresh-white",
+            tooltip = { "gui.bottleneck-calc-extreme-detail-refresh" },
+            enabled = false,
+            style_mods = { right_margin = 8 },
+            mouse_button_filter = { "left" },
+            handler = { [defines.events.on_gui_click] = on_detail_refresh_click },
+        },
+        {
+            type = "sprite-button",
+            name = "button_detail_back",
+            style = "frame_action_button",
+            sprite = "utility/backward_arrow",
+            tooltip = { "gui.bottleneck-calc-extreme-detail-back" },
+            enabled = false,
+            mouse_button_filter = { "left" },
+            handler = { [defines.events.on_gui_click] = on_detail_back_click },
+        },
+        {
+            type = "sprite-button",
+            name = "button_detail_forward",
+            style = "frame_action_button",
+            sprite = "utility/forward_arrow",
+            tooltip = { "gui.bottleneck-calc-extreme-detail-forward" },
+            enabled = false,
+            mouse_button_filter = { "left" },
+            handler = { [defines.events.on_gui_click] = on_detail_forward_click },
+        },
+        {
+            type = "sprite-button",
+            name = "button_detail_close",
+            style = "frame_action_button",
+            sprite = "utility/close",
+            tooltip = { "gui.bottleneck-calc-extreme-detail-close" },
+            enabled = false,
+            style_mods = { left_margin = 8 },
+            mouse_button_filter = { "left" },
+            handler = { [defines.events.on_gui_click] = on_detail_close_click },
+        },
+    }, "scroll_detail")
     detail_pane.style_mods = { horizontally_stretchable = true, vertically_stretchable = true }
     panes[#panes + 1] = {
         type = "flow",
@@ -1243,6 +1299,32 @@ local render_detail ---@type fun(parent: LuaGuiElement, s: BCE.PlayerStorage, re
 
 --- Rows listed per part of the report.
 local DETAIL_ROWS = 15
+--- Width of the report pane while a report is shown: a wider report scrolls sideways instead of
+--- widening the window, so the back and forward buttons stay put.
+local DETAIL_WIDTH = 688
+local DETAIL_WIDTH_COMPACT = 460
+--- Reports remembered for back and forward.
+local DETAIL_HISTORY = 50
+
+--- Back and forward are enabled when there is somewhere to go.
+---@param s BCE.PlayerStorage
+local function update_detail_nav(s)
+    local ui = s.gui
+    local h = s.detail_history
+    local back, forward = ui and ui.button_detail_back, ui and ui.button_detail_forward
+    if (back and back.valid) then
+        back.enabled = h ~= nil and h.pos > 1
+    end
+    if (forward and forward.valid) then
+        forward.enabled = h ~= nil and h.pos < #h.list
+    end
+    -- refresh and close: only with a report shown
+    for _, b in ipairs({ ui and ui.button_detail_refresh or false, ui and ui.button_detail_close or false }) do
+        if (b and b.valid) then
+            b.enabled = s.detail_item ~= nil
+        end
+    end
+end
 
 
 ---@param e EventData.on_gui_click
@@ -1254,13 +1336,37 @@ local function on_detail_item_click(e)
 end
 
 ---@param e EventData.on_gui_click
-local function on_detail_close_click(e)
+on_detail_close_click = function(e)
     local player = game.get_player(e.player_index) --[[@as LuaPlayer]]
     gui.show_item_detail(player, nil)
 end
 
+--- Back (-1) or forward (+1) through the reports viewed.
+---@param player LuaPlayer
+---@param step integer
+local function detail_navigate(player, step)
+    local s = gui.get_storage(player)
+    local h = s.detail_history
+    local entry = h and h.list[h.pos + step]
+    if (not entry) then
+        return
+    end
+    h.pos = h.pos + step
+    gui.show_item_detail(player, entry.id, entry.missing, true)
+end
+
 ---@param e EventData.on_gui_click
-local function on_detail_refresh_click(e)
+on_detail_back_click = function(e)
+    detail_navigate(game.get_player(e.player_index) --[[@as LuaPlayer]], -1)
+end
+
+---@param e EventData.on_gui_click
+on_detail_forward_click = function(e)
+    detail_navigate(game.get_player(e.player_index) --[[@as LuaPlayer]], 1)
+end
+
+---@param e EventData.on_gui_click
+on_detail_refresh_click = function(e)
     local player = game.get_player(e.player_index) --[[@as LuaPlayer]]
     gui.show_item_detail(player, gui.get_storage(player).detail_item)
 end
@@ -1346,6 +1452,8 @@ flib_gui.add_handlers({
     on_detail_close_click = on_detail_close_click,
     on_detail_refresh_click = on_detail_refresh_click,
     on_detail_pick_changed = on_detail_pick_changed,
+    on_detail_back_click = on_detail_back_click,
+    on_detail_forward_click = on_detail_forward_click,
 }, nil, "bce")
 
 --- Draw the targets again after a change that waits for Apply.
@@ -1362,10 +1470,29 @@ end
 ---@param player LuaPlayer
 ---@param id string?
 ---@param missing { type: string, name: string }? picked, but nothing on the surface makes or uses it
-function gui.show_item_detail(player, id, missing)
+---@param from_history boolean? back or forward: the history stays as it is
+function gui.show_item_detail(player, id, missing, from_history)
     local s = gui.get_storage(player)
     s.detail_item = id
     s.detail_missing = missing
+    if (not from_history and (id or missing)) then
+        -- a new report: it goes after the one shown, and what was ahead of that is dropped
+        local h = s.detail_history or { list = {}, pos = 0 }
+        s.detail_history = h
+        local cur = h.list[h.pos]
+        local same = cur and cur.id == id and (cur.missing and cur.missing.type .. "/" .. cur.missing.name)
+            == (missing and missing.type .. "/" .. missing.name)
+        if (not same) then
+            for i = #h.list, h.pos + 1, -1 do
+                h.list[i] = nil
+            end
+            h.list[#h.list + 1] = { id = id, missing = missing }
+            if (#h.list > DETAIL_HISTORY) then
+                table.remove(h.list, 1)
+            end
+            h.pos = #h.list
+        end
+    end
     if (not s.result or not s.gui or not s.gui.wnd_main.valid or not s.gui.table_detail) then
         return
     end
@@ -1376,7 +1503,8 @@ end
 ---@param node Rates.Node
 ---@param id string
 ---@param item BCE.Item?
-local function detail_item_button(node, id, item)
+---@param extra LocalisedString? a line above the coverage
+local function detail_item_button(node, id, item, extra)
     local button = api.gui.gui_button(api.node.gui_default(node))
     local tip = { "" }
     -- the icon's own tooltip is often empty (the item tooltip comes from elem_tooltip)
@@ -1388,6 +1516,9 @@ local function detail_item_button(node, id, item)
     end
     if (button.tooltip and button.tooltip ~= "") then
         line(button.tooltip)
+    end
+    if (extra) then
+        line(extra)
     end
     if (item and item.coverage) then
         line({ "gui.bottleneck-calc-extreme-detail-coverage", percent(item.coverage) })
@@ -1467,17 +1598,9 @@ local function live_caption(live, consumer)
         parts[#parts + 1] = { "gui.bottleneck-calc-extreme-live-waiting-this", tostring(live.waiting_this) }
         parts[#parts + 1] = "[/color]"
     end
-    local others = {}
-    for icon, n in pairs(live.waiting_other) do
-        others[#others + 1] = { icon = icon, n = n }
-    end
-    table.sort(others, function(a, b) if (a.n ~= b.n) then return a.n > b.n end return a.icon < b.icon end)
-    for i, o in ipairs(others) do
-        if (i > 3) then
-            break
-        end
+    if (live.stalled > 0) then
         parts[#parts + 1] = ", "
-        parts[#parts + 1] = { "gui.bottleneck-calc-extreme-live-waiting-for", tostring(o.n), o.icon }
+        parts[#parts + 1] = { "gui.bottleneck-calc-extreme-live-stalled", tostring(live.stalled) }
     end
     if (live.output_full > 0) then
         parts[#parts + 1] = ", "
@@ -1492,6 +1615,27 @@ local function live_caption(live, consumer)
         parts = { "", table.unpack(parts, 2, 20) }
     end
     return parts
+end
+
+--- "waiting for" column: the ingredients stalled buildings lack, as buttons that open their reports.
+---@param live BCE.Live?
+---@param items table<string, BCE.Item>
+local function waiting_cell(live, items)
+    local flow = { type = "flow", style = "packed_horizontal_flow", style_mods = { vertical_align = "center" } }
+    for k, w in ipairs(live and live.waiting or {}) do
+        if (k > 4) then
+            flow[#flow + 1] = { type = "label", caption = "…" }
+            break
+        end
+        local tip = { "gui.bottleneck-calc-extreme-detail-waiting-tooltip", tostring(w.n), tostring(live.total) }
+        if (w.id and w.node) then
+            flow[#flow + 1] = detail_item_button(w.node, w.id, items[w.id], tip)
+        else
+            -- no node for it in the scan: just its icon
+            flow[#flow + 1] = { type = "label", caption = w.icon, tooltip = tip }
+        end
+    end
+    return flow
 end
 
 ---@param d BCE.DetailRow
@@ -1534,8 +1678,11 @@ end
 
 ---@param parent LuaGuiElement
 ---@param caption LocalisedString
-local function detail_caption(parent, caption)
-    flib_gui.add(parent, { type = "label", caption = caption, style = "bold_label", style_mods = { top_margin = 6 } })
+---@param help string? help key: an info icon whose tooltip explains the section
+local function detail_caption(parent, caption, help)
+    flib_gui.add(parent, { type = "label", caption = help and { "", caption, " [img=info]" } or caption,
+        tooltip = help and { "gui.bottleneck-calc-extreme-help-" .. help } or nil,
+        style = "bold_label", style_mods = { top_margin = 6 } })
 end
 
 ---@param parent LuaGuiElement
@@ -1557,7 +1704,13 @@ end
 ---@param result BCE.Result
 render_detail = function(parent, s, result)
     parent.clear()
+    update_detail_nav(s)
     local d = s.detail_item and s.scan and result and detail.build(s.scan, result, s.detail_item)
+    local scroll = s.gui and s.gui.scroll_detail
+    if (scroll and scroll.valid) then
+        -- no report: the compact width, without dead space on the right
+        scroll.style.width = (s.is_pinned or not d) and DETAIL_WIDTH_COMPACT or DETAIL_WIDTH
+    end
     if (not d) then
         -- nothing picked, or something no building on this surface makes or uses
         local missing = s.detail_missing
@@ -1565,7 +1718,7 @@ render_detail = function(parent, s, result)
         local value = proto and { type = missing.type, name = missing.name } or nil
         flib_gui.add(parent, { type = "flow", direction = "horizontal", style_mods = { vertical_align = "center" },
             detail_picker(value, nil),
-            { type = "label", style_mods = { font_color = { 0.6, 0.6, 0.6 }, single_line = false, maximal_width = 400, left_margin = 8 },
+            { type = "label", style_mods = { font_color = { 0.6, 0.6, 0.6 }, single_line = false, width = 340, left_margin = 8 },
                 caption = value and { "gui.bottleneck-calc-extreme-detail-not-found", proto.localised_name }
                     or { "gui.bottleneck-calc-extreme-detail-empty" } } })
         return
@@ -1602,30 +1755,11 @@ render_detail = function(parent, s, result)
         summary[#summary + 1] = { type = "label", caption = difference_caption(item.capacity, item.needed, amt),
             style_mods = { left_margin = 8 } }
     end
-    summary[#summary + 1] = { type = "empty-widget", style = "flib_horizontal_pusher" }
-    for _, button in ipairs({
-        {
-            type = "sprite-button",
-            style = "tool_button",
-            sprite = "utility/refresh",
-            tooltip = { "gui.bottleneck-calc-extreme-detail-refresh" },
-            handler = { [defines.events.on_gui_click] = on_detail_refresh_click },
-        },
-        {
-            type = "sprite-button",
-            style = "tool_button_red",
-            sprite = "utility/close",
-            tooltip = { "gui.bottleneck-calc-extreme-detail-close" },
-            handler = { [defines.events.on_gui_click] = on_detail_close_click },
-        },
-    }) do
-        summary[#summary + 1] = button
-    end
     flib_gui.add(parent, summary)
     local compact = s.is_pinned == true
 
     -- where it goes
-    detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-goes-to" })
+    detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-goes-to" }, "goes-to")
     if (#d.consumers == 0) then
         flib_gui.add(parent, { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-no-consumers" } })
     else
@@ -1633,6 +1767,7 @@ render_detail = function(parent, s, result)
             { "gui.bottleneck-calc-extreme-detail-col-runs" }, { "gui.bottleneck-calc-extreme-detail-col-for" } }
         if (not compact) then
             headers[#headers + 1] = { "gui.bottleneck-calc-extreme-detail-col-now" }
+            headers[#headers + 1] = { "gui.bottleneck-calc-extreme-detail-col-waiting" }
         end
         local tbl = detail_table(parent, headers)
         tbl.style.column_alignments[3] = "right"
@@ -1672,13 +1807,14 @@ render_detail = function(parent, s, result)
             local cells = { recipe_icon, entity_icon, uses, runs_cell(c), makes }
             if (not compact) then
                 cells[#cells + 1] = { type = "label", caption = live_caption(c.live, true) }
+                cells[#cells + 1] = waiting_cell(c.live, items)
             end
             flib_gui.add(tbl, cells)
         end
     end
 
     -- where it comes from
-    detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-made-by" })
+    detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-made-by" }, "made-by")
     if (#d.producers == 0) then
         flib_gui.add(parent, { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-no-producers" } })
     else
@@ -1693,7 +1829,7 @@ render_detail = function(parent, s, result)
             tbl = detail_table(parent, { "", "", { "gui.bottleneck-calc-extreme-col-can-make" },
                 { "gui.bottleneck-calc-extreme-detail-col-makes" }, { "gui.bottleneck-calc-extreme-detail-col-runs" },
                 { "gui.bottleneck-calc-extreme-detail-col-also" }, { "gui.bottleneck-calc-extreme-detail-col-short-inputs" },
-                { "gui.bottleneck-calc-extreme-detail-col-now" } })
+                { "gui.bottleneck-calc-extreme-detail-col-now" }, { "gui.bottleneck-calc-extreme-detail-col-waiting" } })
             for c = 3, 5 do
                 tbl.style.column_alignments[c] = "right"
             end
@@ -1744,13 +1880,14 @@ render_detail = function(parent, s, result)
                 also,
                 short,
                 { type = "label", caption = live_caption(p.live, false) },
+                waiting_cell(p.live, items),
             }) end
         end
     end
 
     -- on to the targets
     if (#d.path > 0) then
-        detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-path" })
+        detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-path" }, "path")
         local flow = { type = "flow", direction = "horizontal", style_mods = { vertical_align = "top", horizontal_spacing = 2 } }
         --- Every step is a 32 px icon over a small label, so arrows and the target get an empty
         --- label under them too and line up with the item buttons.
@@ -1786,10 +1923,8 @@ render_detail = function(parent, s, result)
                 flow[#flow + 1] = column(icon, " ")
             end
         end
-        local wrap = parent.add({ type = "scroll-pane", horizontal_scroll_policy = "auto", vertical_scroll_policy = "never" })
-        -- scrolls rather than widening the window; narrower still in the compact view
-        wrap.style.maximal_width = compact and 360 or 640
-        flib_gui.add(wrap, flow)
+        -- the whole report scrolls sideways when it is too wide
+        flib_gui.add(parent, flow)
     end
 end
 

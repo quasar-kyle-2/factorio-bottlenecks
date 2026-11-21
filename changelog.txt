@@ -1,4 +1,22 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.9.0
+Date: 2026-11-20
+  Features:
+    - Item report: a "waiting for" column lists what stalled buildings lack, as icons that open
+      that item's report (the tooltip says how many of the buildings wait for it). "Made by" has
+      an info icon explaining its columns
+    - Item report: back and forward buttons in its title bar go through the reports you looked at
+    - Item report: "Goes to" and "On the way to your targets" have their own info icons; the
+      report's own help is shorter and says what each section is for
+  Changes:
+    - Item report: "now" sums the buildings waiting for other ingredients as "stalled"
+    - Item report: a fixed width, so the window no longer changes size from one item to the next;
+      a wide report scrolls sideways (with no item shown it is as narrow as the compact view)
+    - Item report: refresh and close moved to its title bar, next to back and forward
+    - The selection tool button is in the compact view too, left of the status line
+    - The rescan tooltip warns that a large factory can freeze briefly and then run slowly while
+      it is analyzed, and points to the "Solver work per tick" setting
+---------------------------------------------------------------------------------------------------
 Version: 0.2.2
 Date: 2026-11-20
   Features:

@@ -19,7 +19,8 @@ local detail = {}
 ---@field total integer
 ---@field working integer
 ---@field waiting_this integer waiting for this item
----@field waiting_other table<string, integer> rich-text icon -> buildings waiting for it
+---@field stalled integer waiting for another ingredient
+---@field waiting { id: string?, node: Rates.Node?, icon: string, n: integer }[] those ingredients, most buildings first
 ---@field output_full integer
 ---@field other integer
 
@@ -124,7 +125,8 @@ end
 ---@param this_name string?
 ---@return BCE.Live
 local function read_live(row, this_type, this_name)
-    local live = { total = 0, working = 0, waiting_this = 0, waiting_other = {}, output_full = 0, other = 0 }
+    local live = { total = 0, working = 0, waiting_this = 0, stalled = 0, waiting = {}, output_full = 0, other = 0 }
+    local waiting = {} ---@type table<string, { id: string?, node: Rates.Node?, icon: string, n: integer }>
     local ingredients = {}
     local conf = row.conf
     if (conf and conf.type == "meta" and conf.children) then
@@ -134,7 +136,16 @@ local function read_live(row, this_type, this_name)
     if (recipe) then
         pcall(function()
             for _, ing in ipairs(recipe.ingredients) do
-                ingredients[#ingredients + 1] = { type = ing.type, name = ing.name, amount = ing.amount }
+                local i = { type = ing.type, name = ing.name, amount = ing.amount,
+                    icon = "[" .. ing.type .. "=" .. ing.name .. "]" }
+                -- its node in the row, for a button that opens its report
+                for _, a in ipairs(row.amounts) do
+                    if (a.amount < 0 and detail.node_is(a.node, ing.type, ing.name)) then
+                        i.id, i.node = a.id, a.node
+                        break
+                    end
+                end
+                ingredients[#ingredients + 1] = i
             end
         end)
     end
@@ -157,19 +168,27 @@ local function read_live(row, this_type, this_name)
                             missing = true
                             break
                         end
-                        missing = missing or ("[" .. ing.type .. "=" .. ing.name .. "]")
+                        missing = missing or ing
                     end
                 end
                 if (missing == true) then
                     live.waiting_this = live.waiting_this + 1
                 elseif (missing) then
-                    live.waiting_other[missing] = (live.waiting_other[missing] or 0) + 1
+                    live.stalled = live.stalled + 1
+                    local w = waiting[missing.icon]
+                    if (not w) then
+                        w = { id = missing.id, node = missing.node, icon = missing.icon, n = 0 }
+                        waiting[missing.icon] = w
+                        live.waiting[#live.waiting + 1] = w
+                    end
+                    w.n = w.n + 1
                 else
                     live.other = live.other + 1
                 end
             end
         end
     end
+    table.sort(live.waiting, function(a, b) if (a.n ~= b.n) then return a.n > b.n end return a.icon < b.icon end)
     return live
 end
 
