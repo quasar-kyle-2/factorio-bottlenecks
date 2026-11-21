@@ -154,13 +154,11 @@ local function ftran(st, v)
         if (vp and vp ~= 0) then
             local idx, val = e.idx, e.val
             local cnt = #idx
-            for s = 1, cnt do
+            -- idx[1] is always p (add_eta and reinvert put it first), and p appears nowhere else
+            v[p] = val[1] * vp
+            for s = 2, cnt do
                 local i = idx[s]
-                if (i == p) then
-                    v[p] = val[s] * vp
-                else
-                    v[i] = (v[i] or 0) + val[s] * vp
-                end
+                v[i] = (v[i] or 0) + val[s] * vp
             end
             work = work + cnt
         end
@@ -169,32 +167,72 @@ local function ftran(st, v)
     return v
 end
 
+local sort = table.sort
+
 --- u := u^T B^-1 (in place)
 local function btran(st, u)
     local etas = st.etas
     local work = 0
+    -- entries in u: each eta sets or clears only u[p]
+    local nu = 0
+    for _ in pairs(u) do
+        nu = nu + 1
+    end
+    local hits = {}
     for k = #etas, 1, -1 do
         local e = etas[k]
         local idx, val = e.idx, e.val
         local cnt = #idx
         local acc = 0
-        for s = 1, cnt do
-            local ui = u[idx[s]]
-            if (ui) then
-                acc = acc + ui * val[s]
+        local at = e.at
+        if (at and nu * 6 < cnt) then
+            -- A long eta and few entries in u: the same terms, added in the same order (by
+            -- position in idx), found from u's side.
+            local nh = 0
+            for i, _ in pairs(u) do
+                local s = at[i]
+                if (s) then
+                    nh = nh + 1
+                    hits[nh] = s
+                end
+            end
+            if (nh > 1) then
+                for h = #hits, nh + 1, -1 do
+                    hits[h] = nil
+                end
+                sort(hits)
+            end
+            for h = 1, nh do
+                local s = hits[h]
+                acc = acc + u[idx[s]] * val[s]
+            end
+        else
+            for s = 1, cnt do
+                local ui = u[idx[s]]
+                if (ui) then
+                    acc = acc + ui * val[s]
+                end
             end
         end
         work = work + cnt
+        local p = e.p
         if (acc > DROP_TOL or acc < -DROP_TOL) then
-            u[e.p] = acc
-        else
-            u[e.p] = nil
+            if (u[p] == nil) then
+                nu = nu + 1
+            end
+            u[p] = acc
+        elseif (u[p] ~= nil) then
+            nu = nu - 1
+            u[p] = nil
         end
     end
     st.work = st.work + work
     return u
 end
 
+--- Every eta's idx[1] is its pivot row p, which appears nowhere else in idx (ftran relies on it).
+--- Update etas are often long: `at` (row -> position in idx) lets btran pick out the few
+--- entries it needs.
 local function add_eta(etas, alpha, r)
     local ar = alpha[r]
     local idx, val = { r }, { 1 / ar }
@@ -204,59 +242,73 @@ local function add_eta(etas, alpha, r)
             val[#val + 1] = -a / ar
         end
     end
-    etas[#etas + 1] = { p = r, idx = idx, val = val }
+    local at
+    if (#idx >= 24) then
+        at = {}
+        for s = 1, #idx do
+            at[idx[s]] = s
+        end
+    end
+    etas[#etas + 1] = { p = r, idx = idx, val = val, at = at }
 end
 
--- binary min-heap of (count, j) with parallel arrays
-local function heap_less(hc, hj, a, b)
-    return hc[a] < hc[b] or (hc[a] == hc[b] and hj[a] < hj[b])
-end
+-- Binary min-heap of (count, j), ordered by count, then j. Each entry is one number,
+-- count * S + j with S > every column index, which orders the same way (exact in a double).
+local floor = math.floor
 
 local function heap_push(h, cnt, j)
-    local hc, hj = h.c, h.j
+    local hk = h.k
+    local key = cnt * h.S + j
     local k = h.n + 1
     h.n = k
-    hc[k], hj[k] = cnt, j
     while (k > 1) do
-        local parent = math.floor(k / 2)
-        if (heap_less(hc, hj, k, parent)) then
-            hc[k], hc[parent] = hc[parent], hc[k]
-            hj[k], hj[parent] = hj[parent], hj[k]
+        local parent = floor(k / 2)
+        local pk = hk[parent]
+        if (key < pk) then
+            hk[k] = pk
             k = parent
         else
             break
         end
     end
+    hk[k] = key
 end
 
 local function heap_pop(h)
-    local hc, hj = h.c, h.j
-    local cnt, j = hc[1], hj[1]
+    local hk = h.k
+    local top = hk[1]
     local last = h.n
-    hc[1], hj[1] = hc[last], hj[last]
-    hc[last], hj[last] = nil, nil
+    local x = hk[last]
+    hk[last] = nil
     last = last - 1
     h.n = last
-    local k = 1
-    while (true) do
-        local l = 2 * k
-        if (l > last) then
-            break
+    if (last > 0) then
+        local k = 1
+        while (true) do
+            local l = 2 * k
+            if (l > last) then
+                break
+            end
+            local smallest, sv = l, hk[l]
+            local r = l + 1
+            if (r <= last) then
+                local rv = hk[r]
+                if (rv < sv) then
+                    smallest, sv = r, rv
+                end
+            end
+            if (sv < x) then
+                hk[k] = sv
+                k = smallest
+            else
+                break
+            end
         end
-        local r = l + 1
-        local smallest = l
-        if (r <= last and heap_less(hc, hj, r, l)) then
-            smallest = r
-        end
-        if (heap_less(hc, hj, smallest, k)) then
-            hc[k], hc[smallest] = hc[smallest], hc[k]
-            hj[k], hj[smallest] = hj[smallest], hj[k]
-            k = smallest
-        else
-            break
-        end
+        hk[k] = x
     end
-    return cnt, j
+    local S = h.S
+    local j = top % S
+    return (top - j) / S, j
 end
 
 --- Recompute basic values and all reduced costs from scratch for the current factorization.
@@ -335,7 +387,7 @@ local function reinvert(st)
         rowcount[i] = 0
     end
     local colrows, colcount = {}, {}
-    local heap = { n = 0, c = {}, j = {} }
+    local heap = { n = 0, k = {}, S = st.N + 1 }
     for i = 1, m do
         local j = st.basis[i]
         local cr, cnt = {}, 0
@@ -522,6 +574,31 @@ local function choose_entering(st)
     local d, w, K = st.d, st.weights, st.K
     local bland = st.degenerate_run > BLAND_AFTER
     local best, best_score = nil, st.opt_tol or OPT_TOL
+    if (K == 1) then
+        -- same test as below: score = dj at the upper bound, -dj at 0, must beat best_score
+        local d1, w1 = d[1], w[1]
+        for j = 1, st.N do
+            local dj = w1 * d1[j]
+            local score
+            if (-dj > best_score) then
+                if (not at_upper[j]) then
+                    score = -dj
+                end
+            elseif (dj > best_score) then
+                if (at_upper[j]) then
+                    score = dj
+                end
+            end
+            if (score and not pos[j] and upper[j] ~= 0) then
+                if (bland) then
+                    return j
+                end
+                best, best_score = j, score
+            end
+        end
+        st.work = st.work + st.N * K
+        return best
+    end
     for j = 1, st.N do
         if (not pos[j] and upper[j] ~= 0) then
             local dj = 0
