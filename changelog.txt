@@ -1,4 +1,21 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.0.0
+Date: 2026-11-21
+  Changes:
+    - Item report, made by: the "plan makes" column is now "needed", and "also makes" lists
+      at most 3 items
+    - Item report, made by: "short inputs" is now "inputs" and shows every ingredient, short
+      ones first with a red background, up to 4 (the coverage is in the tooltip)
+    - Item report: the "Goes to" and "Made by" captions sit in their tables' header row, over the
+      building icons, and the first number column has more room
+    - Item report, goes to: "makes" is now "outputs" and shows them like the inputs: short ones
+      first with a red background, up to 4, the coverage in the tooltip
+    - Item report: the reported item's button is as big as the ones in the item lists
+    - Item report: a line over each section
+    - Item report, goes to: "not for targets" is now "—", so the uses column stays narrow
+    - Item report, made by: "can make" is now "makes" and "also makes" is now "byproducts"
+    - Item report: 2 px more space between the columns of Goes to and Made by
+---------------------------------------------------------------------------------------------------
 Version: 0.9.2
 Date: 2026-11-20
   Changes:

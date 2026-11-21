@@ -1552,7 +1552,6 @@ local function detail_picker(value, item)
         elem_type = "signal",
         mouse_button_filter = { "left" },
         style = "flib_slot_button_default",
-        style_mods = { size = 32 },
         tooltip = tip,
         tags = { bce_pipette = value and { type = value.type, name = value.name } or nil },
         elem_mods = { elem_value = value },
@@ -1661,7 +1660,8 @@ local function detail_row_icons(d)
         b.tags = tags
         b.handler = { [defines.events.on_gui_click] = on_detail_building_click }
     end
-    return create_node_icon(api.configuration.gui_recipe(d.row.conf), nil, recipe_pipette(d.row.conf)), entity_icon
+    return { type = "flow", direction = "horizontal", style_mods = { vertical_align = "center", horizontal_spacing = 8 },
+        create_node_icon(api.configuration.gui_recipe(d.row.conf), nil, recipe_pipette(d.row.conf)), entity_icon }
 end
 
 --- "runs" column: the plan's buildings compared to the ones you have.
@@ -1676,6 +1676,12 @@ local function runs_cell(d)
         tooltip = { "gui.bottleneck-calc-extreme-detail-runs-tooltip" } }
 end
 
+--- The horizontal rule over each report section.
+---@param parent LuaGuiElement
+local function detail_separator(parent)
+    flib_gui.add(parent, { type = "line", direction = "horizontal", style_mods = { top_margin = 6 } })
+end
+
 ---@param parent LuaGuiElement
 ---@param caption LocalisedString
 ---@param help string? help key: an info icon whose tooltip explains the section
@@ -1685,16 +1691,35 @@ local function detail_caption(parent, caption, help)
         style = "bold_label", style_mods = { top_margin = 6 } })
 end
 
+--- Extra space left of a report table's first number column, after the icons.
+local DETAIL_GAP = 8
+
+--- Gives a report table's second-column cell (the first number) its gap from the icons.
+---@param cell table
+---@return table
+local function detail_gap(cell)
+    cell.style_mods = cell.style_mods or {}
+    cell.style_mods.left_padding = DETAIL_GAP
+    return cell
+end
+
+--- A report section as one table: the section caption sits over the icon column, in the
+--- headers' row. Column 1 is the icons (`detail_row_icons`), column 2 gets `detail_gap`.
 ---@param parent LuaGuiElement
----@param headers LocalisedString[]
-local function detail_table(parent, headers)
-    local tbl = parent.add({ type = "table", column_count = #headers })
-    tbl.style.horizontal_spacing = 8
+---@param caption LocalisedString
+---@param help string help key: an info icon whose tooltip explains the section
+---@param headers LocalisedString[] the headers of columns 2 and on
+local function detail_table(parent, caption, help, headers)
+    local tbl = parent.add({ type = "table", column_count = #headers + 1 })
+    tbl.style.horizontal_spacing = 10
     tbl.style.vertical_spacing = 0
-    local row = {}
+    tbl.style.top_margin = 6
+    local row = { { type = "label", caption = { "", caption, " [img=info]" },
+        tooltip = { "gui.bottleneck-calc-extreme-help-" .. help }, style = "bold_label" } }
     for i, h in ipairs(headers) do
-        row[i] = { type = "label", caption = h, style_mods = { font_color = color_grey } }
+        row[i + 1] = { type = "label", caption = h, style_mods = { font_color = color_grey } }
     end
+    detail_gap(row[2])
     flib_gui.add(tbl, row)
     return tbl
 end
@@ -1741,6 +1766,7 @@ render_detail = function(parent, s, result)
         -- heat and such: its icon, and an empty slot to pick something else
         local icon = detail_item_button(d.node, d.id, item)
         icon.handler, icon.tags.detail_id = nil, nil
+        icon.style_mods = nil
         icon.tooltip = item and item.coverage and { "gui.bottleneck-calc-extreme-detail-coverage", percent(item.coverage) } or nil
         summary[#summary + 1] = icon
         summary[#summary + 1] = detail_picker(nil, nil)
@@ -1759,25 +1785,26 @@ render_detail = function(parent, s, result)
     local compact = s.is_pinned == true
 
     -- where it goes
-    detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-goes-to" }, "goes-to")
+    detail_separator(parent)
     if (#d.consumers == 0) then
+        detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-goes-to" }, "goes-to")
         flib_gui.add(parent, { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-no-consumers" } })
     else
-        local headers = { "", "", { "gui.bottleneck-calc-extreme-detail-col-uses" },
+        local headers = { { "gui.bottleneck-calc-extreme-detail-col-uses" },
             { "gui.bottleneck-calc-extreme-detail-col-runs" }, { "gui.bottleneck-calc-extreme-detail-col-for" } }
         if (not compact) then
             headers[#headers + 1] = { "gui.bottleneck-calc-extreme-detail-col-now" }
             headers[#headers + 1] = { "gui.bottleneck-calc-extreme-detail-col-waiting" }
         end
-        local tbl = detail_table(parent, headers)
+        local tbl = detail_table(parent, { "gui.bottleneck-calc-extreme-detail-goes-to" }, "goes-to", headers)
+        tbl.style.column_alignments[2] = "right"
         tbl.style.column_alignments[3] = "right"
-        tbl.style.column_alignments[4] = "right"
         for i, c in ipairs(d.consumers) do
             if (i > DETAIL_ROWS) then
                 flib_gui.add(parent, { type = "label", caption = { "gui.bottleneck-calc-extreme-more", tostring(#d.consumers - DETAIL_ROWS) } })
                 break
             end
-            local recipe_icon, entity_icon = detail_row_icons(c)
+            local icons = detail_row_icons(c)
             local uses
             if (c.x) then
                 uses = { type = "label", caption = amt(c.rate) }
@@ -1786,25 +1813,32 @@ render_detail = function(parent, s, result)
                     style_mods = { font_color = color_grey },
                     tooltip = { "gui.bottleneck-calc-extreme-detail-not-for-targets-tooltip", amt(c.per_building * c.have) } }
             end
+            -- outputs: short ones first (lowest coverage first, red), then the rest; at most 4
+            -- unless more are short
             local makes = { type = "flow", style = "packed_horizontal_flow", style_mods = { vertical_align = "center" } }
-            local hidden = 0
+            local n_short = 0
             for _, id in ipairs(c.products or {}) do
                 local e = items[id]
-                if (compact and not (e.coverage and e.coverage < 1 - 1e-6)) then
-                    -- compact: only the short ones, the covered ones as a count
-                    hidden = hidden + 1
-                elseif (#makes >= 6) then
-                    hidden = hidden + 1
-                else
-                    makes[#makes + 1] = detail_item_button(e.node, id, e)
-                    makes[#makes + 1] = { type = "label", caption = e.coverage and percent(e.coverage) or "",
-                        style_mods = { font_color = coverage_color(e.coverage), left_margin = 2, right_margin = 6 } }
+                if (e.coverage and e.coverage < 1) then
+                    n_short = n_short + 1
                 end
             end
-            if (hidden > 0) then
-                makes[#makes + 1] = { type = "label", caption = compact and ("(+" .. hidden .. ")") or "…" }
+            local shown = 0
+            for _, id in ipairs(c.products or {}) do
+                local e = items[id]
+                local is_short = e.coverage and e.coverage < 1
+                if (not is_short and math.max(shown, n_short) >= 4) then
+                    makes[#makes + 1] = { type = "label", caption = "…" }
+                    break
+                end
+                local button = detail_item_button(e.node, id, e)
+                if (is_short) then
+                    button.style = "flib_slot_button_red"
+                end
+                makes[#makes + 1] = button
+                shown = shown + 1
             end
-            local cells = { recipe_icon, entity_icon, uses, runs_cell(c), makes }
+            local cells = { icons, detail_gap(uses), runs_cell(c), makes }
             if (not compact) then
                 cells[#cells + 1] = { type = "label", caption = live_caption(c.live, true) }
                 cells[#cells + 1] = waiting_cell(c.live, items)
@@ -1814,23 +1848,24 @@ render_detail = function(parent, s, result)
     end
 
     -- where it comes from
-    detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-made-by" }, "made-by")
+    detail_separator(parent)
     if (#d.producers == 0) then
+        detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-made-by" }, "made-by")
         flib_gui.add(parent, { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-no-producers" } })
     else
         local tbl
         if (compact) then
-            tbl = detail_table(parent, { "", "", { "gui.bottleneck-calc-extreme-col-difference" },
+            tbl = detail_table(parent, { "gui.bottleneck-calc-extreme-detail-made-by" }, "made-by", { { "gui.bottleneck-calc-extreme-col-difference" },
                 { "gui.bottleneck-calc-extreme-detail-col-runs" }, { "gui.bottleneck-calc-extreme-detail-col-short-inputs" } })
-            for c = 3, 4 do
+            for c = 2, 3 do
                 tbl.style.column_alignments[c] = "right"
             end
         else
-            tbl = detail_table(parent, { "", "", { "gui.bottleneck-calc-extreme-col-can-make" },
+            tbl = detail_table(parent, { "gui.bottleneck-calc-extreme-detail-made-by" }, "made-by", { { "gui.bottleneck-calc-extreme-detail-col-can-make" },
                 { "gui.bottleneck-calc-extreme-detail-col-makes" }, { "gui.bottleneck-calc-extreme-detail-col-runs" },
                 { "gui.bottleneck-calc-extreme-detail-col-also" }, { "gui.bottleneck-calc-extreme-detail-col-short-inputs" },
                 { "gui.bottleneck-calc-extreme-detail-col-now" }, { "gui.bottleneck-calc-extreme-detail-col-waiting" } })
-            for c = 3, 5 do
+            for c = 2, 4 do
                 tbl.style.column_alignments[c] = "right"
             end
         end
@@ -1839,41 +1874,46 @@ render_detail = function(parent, s, result)
                 flib_gui.add(parent, { type = "label", caption = { "gui.bottleneck-calc-extreme-more", tostring(#d.producers - DETAIL_ROWS) } })
                 break
             end
-            local recipe_icon, entity_icon = detail_row_icons(p)
+            local icons = detail_row_icons(p)
             local also = { type = "flow", style = "packed_horizontal_flow", style_mods = { vertical_align = "center" } }
             for k, id in ipairs(p.byproducts or {}) do
-                if (k > 4) then
+                if (k > 3) then
                     also[#also + 1] = { type = "label", caption = "…" }
                     break
                 end
                 also[#also + 1] = detail_item_button(items[id].node, id, items[id])
             end
+            -- inputs: short ones first (lowest coverage first, red), then the rest; at most 4
             local short = { type = "flow", style = "packed_horizontal_flow", style_mods = { vertical_align = "center" } }
             local short_list = {}
             for _, id in ipairs(p.short_inputs or {}) do
                 short_list[#short_list + 1] = items[id]
             end
             table.sort(short_list, function(a, b) return a.coverage < b.coverage end)
-            for k, e in ipairs(short_list) do
-                if (k > 3) then
+            for _, e in ipairs(short_list) do
+                local button = detail_item_button(e.node, e.id, e)
+                button.style = "flib_slot_button_red"
+                short[#short + 1] = button
+            end
+            local others = p.other_inputs or {}
+            for k, id in ipairs(others) do
+                if (#short_list + k > 4) then
                     short[#short + 1] = { type = "label", caption = "…" }
                     break
                 end
-                short[#short + 1] = detail_item_button(e.node, e.id, e)
-                short[#short + 1] = { type = "label", caption = percent(e.coverage),
-                    style_mods = { font_color = coverage_color(e.coverage), left_margin = 2, right_margin = 6 } }
+                short[#short + 1] = detail_item_button(items[id].node, id, items[id])
             end
             if (compact) then
                 flib_gui.add(tbl, {
-                    recipe_icon, entity_icon,
-                    { type = "label", caption = p.x and difference_caption(p.per_building * p.have, p.rate, amt) or "",
-                        tooltip = not p.x and { "gui.bottleneck-calc-extreme-detail-not-for-targets-tooltip-made" } or nil },
+                    icons,
+                    detail_gap({ type = "label", caption = p.x and difference_caption(p.per_building * p.have, p.rate, amt) or "",
+                        tooltip = not p.x and { "gui.bottleneck-calc-extreme-detail-not-for-targets-tooltip-made" } or nil }),
                     runs_cell(p),
                     short,
                 })
             else flib_gui.add(tbl, {
-                recipe_icon, entity_icon,
-                { type = "label", caption = amt(p.per_building * p.have) },
+                icons,
+                detail_gap({ type = "label", caption = amt(p.per_building * p.have) }),
                 { type = "label", caption = p.x and amt(p.rate) or "",
                     tooltip = not p.x and { "gui.bottleneck-calc-extreme-detail-not-for-targets-tooltip-made" } or nil },
                 runs_cell(p),
@@ -1887,6 +1927,7 @@ render_detail = function(parent, s, result)
 
     -- on to the targets
     if (#d.path > 0) then
+        detail_separator(parent)
         detail_caption(parent, { "gui.bottleneck-calc-extreme-detail-path" }, "path")
         local flow = { type = "flow", direction = "horizontal", style_mods = { vertical_align = "top", horizontal_spacing = 2 } }
         --- Every step is a 32 px icon over a small label, so arrows and the target get an empty

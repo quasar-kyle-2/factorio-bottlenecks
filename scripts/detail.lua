@@ -12,6 +12,7 @@ local detail = {}
 ---@field rate number? item per second the plan uses or makes here
 ---@field byproducts string[]? other things it makes (node ids)
 ---@field short_inputs string[]? its ingredients that are short (node ids)
+---@field other_inputs string[]? its other ingredients (node ids)
 ---@field products string[]? consumers: what it makes, lowest coverage first (node ids)
 ---@field live BCE.Live?
 
@@ -236,14 +237,18 @@ function detail.build(scan, result, id)
                     end)
                     consumers[#consumers + 1] = d
                 elseif (not row.is_target) then
-                    d.byproducts, d.short_inputs = {}, {}
+                    d.byproducts, d.short_inputs, d.other_inputs = {}, {}, {}
                     for _, b in ipairs(row.amounts) do
                         local e = items[b.id]
-                        if (b.id ~= id and e and e.mode == "counted") then
+                        if (b.id ~= id and e) then
                             if (b.amount > 0) then
-                                d.byproducts[#d.byproducts + 1] = b.id
-                            elseif (e.coverage and e.coverage < 1) then
+                                if (e.mode == "counted") then
+                                    d.byproducts[#d.byproducts + 1] = b.id
+                                end
+                            elseif (e.mode == "counted" and e.coverage and e.coverage < 1) then
                                 d.short_inputs[#d.short_inputs + 1] = b.id
+                            elseif (b.amount < 0) then
+                                d.other_inputs[#d.other_inputs + 1] = b.id
                             end
                         end
                     end
