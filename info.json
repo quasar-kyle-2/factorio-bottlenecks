@@ -5,7 +5,7 @@
   "title": "Bottleneck Calculator Extreme",
   "author": "Kyle",
   "homepage": "https://github.com/quasar-kyle-2/factorio-bottlenecks",
-  "description": "Select your labs (or any buildings) and set how fast each group should run. Scans the whole surface and shows, item by item, how much their supply chain needs and how much your factory can make: what runs short first, and by how much. Inspired by Production Rates Calculator Extreme.",
+  "description": "Select your labs (or any buildings) and set how fast each group should run. Scans the whole surface and shows, item by item, how much their supply chain needs and how much your factory can make: what runs short first, and by how much.",
   "dependencies": [
     "sw-rates-lib >= 0.5.8",
     "sw-entity-tracker",
