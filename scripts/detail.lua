@@ -1,6 +1,8 @@
 -- Item report: where an item goes and where it comes from, from the last answer and from what
 -- the buildings are doing right now.
 
+local api = require("__sw-rates-lib__.api-usage")
+
 local detail = {}
 
 ---@class BCE.DetailRow
@@ -333,6 +335,478 @@ function detail.build(scan, result, id)
     end
 
     return { id = id, item = items[id], node = node, consumers = consumers, producers = producers, path = path }
+end
+
+-- ---------------------------------------------------------------------------
+-- Productivity: where productivity modules cut the demand for an item the most
+--
+-- Every building group the plan runs pulls on the item, directly or through its ingredients:
+-- its "draw" is the item per second its inputs cost, all the way up the chain. With its output
+-- held where it is, a group with productivity p uses 1/(1+p) of the inputs it uses without
+-- any, so its draw scales the same way. Only productivity matters: speed, beacons and building
+-- counts only change how many buildings it takes to keep the output.
+--
+-- Each group is scored as if its own modules were taken out (beacons and everything else
+-- stay): what filling every slot with the best productivity module that fits and is unlocked
+-- saves, per module. Full groups keep their place in the list, so it shows at a glance whether
+-- the modules you have are in the best spots.
+
+local cutil = require("__sw-rates-lib__.scripts.configuration-util")
+
+--- Every productivity module and the recipes that make it. Prototype data, the same for every
+--- player and save, so it is worked out once.
+local prod_module_recipes = nil ---@type { module: LuaItemPrototype, recipes: string[] }[]?
+
+--- The productivity modules the force can make: an enabled recipe makes them.
+---@param force LuaForce
+---@return LuaItemPrototype[]
+local function unlocked_prod_modules(force)
+    if (not prod_module_recipes) then
+        prod_module_recipes = {}
+        for name, m in pairs(prototypes.get_item_filtered({ { filter = "type", type = "module" } })) do
+            local fx = m.module_effects
+            if (fx and (fx.productivity or 0) > 0) then
+                local recipes = {}
+                for rname, _ in pairs(prototypes.get_recipe_filtered({ { filter = "has-product-item",
+                        elem_filters = { { filter = "name", name = name } } } })) do
+                    recipes[#recipes + 1] = rname
+                end
+                prod_module_recipes[#prod_module_recipes + 1] = { module = m, recipes = recipes }
+            end
+        end
+        table.sort(prod_module_recipes, function(x, y) return x.module.name < y.module.name end)
+    end
+    local list = {}
+    for _, e in ipairs(prod_module_recipes) do
+        for _, rname in ipairs(e.recipes) do
+            local r = force.recipes[rname]
+            if (r and r.enabled) then
+                list[#list + 1] = e.module
+                break
+            end
+        end
+    end
+    return list
+end
+
+local good_when_positive = { speed = true, productivity = true, quality = true }
+
+--- Whether a module goes in: every effect it gives is allowed, and its category is.
+---@param m LuaItemPrototype
+---@param allowed table<string, boolean>?
+---@param categories table<string, boolean>?
+local function module_allowed(m, allowed, categories)
+    if (categories and not categories[m.category]) then
+        return false
+    end
+    if (allowed) then
+        for name, value in pairs(m.module_effects or {}) do
+            local good = good_when_positive[name] and value > 0 or (not good_when_positive[name] and value < 0)
+            if (good and not allowed[name]) then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+---@class BCE.ProdInfo
+---@field slots integer module slots per building
+---@field module LuaItemPrototype the best productivity module that fits
+---@field p_none number productivity without its modules
+---@field p_now number
+---@field p_max number every slot holding that module
+
+--- What productivity a group gets without its modules, now, and with every slot holding the
+--- best productivity module that fits and is unlocked. nil: no such module, or it adds nothing.
+---@param conf Rates.Configuration
+---@param force LuaForce
+---@param surface LuaSurface?
+---@param modules LuaItemPrototype[] unlocked productivity modules
+---@return BCE.ProdInfo?
+local function prod_info(conf, force, surface, modules)
+    if (conf.type == "meta" and conf.children) then
+        conf = conf.children[1]
+    end
+    local entity = conf.entity
+    local additional, max_effect = {}, nil
+    if (conf.type == "crafting-machine") then
+        local r = force.recipes[conf.recipe.name]
+        additional[1] = { productivity = r and r.productivity_bonus or 0 }
+        max_effect = { productivity = conf.recipe.maximum_productivity }
+    elseif (conf.type == "mining-drill") then
+        if (entity.uses_force_mining_productivity_bonus) then
+            additional[1] = { productivity = force.mining_drill_productivity_bonus }
+        end
+    elseif (conf.type == "lab") then
+        additional[1] = { productivity = force.laboratory_productivity_bonus }
+    else
+        return nil
+    end
+    local ok, info = pcall(function()
+        local slots = entity.module_inventory_size or 0
+        local receiver = entity.effect_receiver
+        if (slots == 0 or (receiver and receiver.uses_module_effects == false)) then
+            return nil
+        end
+        local recipe = conf.type == "crafting-machine" and conf.recipe or nil
+        local best, best_p = nil, 0
+        for _, m in ipairs(modules) do
+            if (module_allowed(m, entity.allowed_effects, entity.allowed_module_categories)
+                    and (not recipe or module_allowed(m, recipe.allowed_effects, recipe.allowed_module_categories))) then
+                local p = m.module_effects.productivity
+                if (p > best_p) then
+                    best, best_p = m, p
+                end
+            end
+        end
+        if (not best) then
+            return nil
+        end
+        local fx = conf.module_effects or {}
+        local function with_modules(modules)
+            local copy = { modules = modules, beacons = fx.beacons, local_effect = fx.local_effect }
+            local surface_effect = surface and surface.global_effect or nil
+            return cutil.calculate_effects(receiver, copy, surface_effect, additional, max_effect, force,
+                function() return true end).productivity
+        end
+        local p_none = with_modules({})
+        local p_now = with_modules(fx.modules or {})
+        local p_max = with_modules({ { module = best, quality = prototypes.quality.normal, count = slots } })
+        if (p_max <= p_none + 1e-9) then
+            return nil
+        end
+        return { slots = slots, module = best, p_none = p_none, p_now = p_now, p_max = p_max }
+    end)
+    return ok and info or nil
+end
+
+---@class BCE.ProdRow
+---@field ri integer
+---@field row BCE.Row
+---@field have number buildings you have
+---@field draw number item per second the group pulls, through everything it uses, now
+---@field saves number item per second its modules save (or would) when every slot is filled
+---@field modules integer modules to fill every slot
+---@field per_module number saves / modules
+---@field status "full" | "part" | "none"
+---@field info BCE.ProdInfo
+---@field products string[] what it makes (node ids)
+
+--- What an item costs in the reported item, per unit made, through the plan's flows. A
+--- building's draw goes to the products that make it run: the ones the plan uses all of
+--- (byproducts it makes too much of come free). Solved by repeating until nothing changes.
+---
+--- It runs as a job, a little each tick (a big base takes about a second in one go). The job is
+--- plain data, so it can sit in storage: start it, then step it until it says it's done.
+
+--- Work units a step gets per tick. A big Py base takes about 140k for a report, about 0.1 s in
+--- one go on a fast PC and about 1 s on a busy game: 2500 a tick spreads that over about a
+--- second, at roughly half the frame rate while it runs.
+detail.PROD_WORK_PER_TICK = 2500
+--- Work units one group's module check counts for.
+local PROD_INFO_WORK = 40
+local MAX_PASSES = 200
+
+---@class BCE.ProdJob
+---@field id string
+---@field scan BCE.Scan
+---@field result BCE.Result
+---@field force LuaForce
+---@field phase "flows" | "charge" | "pass" | "modules" | "done"
+---@field i integer
+---@field work integer units done so far
+---@field counted table<string, true>
+---@field made table<string, number>
+---@field used table<string, number>
+---@field running integer[]
+---@field any_children table<string, string[]>
+---@field charge table<integer, { id: string, w: number }[]>
+---@field cost table<string, number>
+---@field draw table<integer, number>
+---@field charged table<string, number>
+---@field passes integer
+---@field pull integer[] rows that pull on the item
+---@field modules LuaItemPrototype[]? unlocked productivity modules
+---@field list BCE.ProdRow[] the answer, best use of a module first
+---@field pulling integer groups that pull on it at all
+---@field settled boolean false: a loop kept the draws from settling
+
+---@param scan BCE.Scan
+---@param result BCE.Result
+---@param id string
+---@param force LuaForce
+---@return BCE.ProdJob
+function detail.productivity_start(scan, result, id, force)
+    local counted = {}
+    for _, e in ipairs(result.items) do
+        if (e.mode == "counted") then
+            counted[e.id] = true
+        end
+    end
+    return { id = id, scan = scan, result = result, force = force, phase = "flows", i = 1, work = 0,
+        counted = counted, made = {}, used = {}, running = {}, any_children = {}, charge = {},
+        cost = { [id] = 1 }, draw = {}, charged = {}, passes = 0, pull = {}, list = {}, pulling = 0, settled = false }
+end
+
+---@param job BCE.ProdJob
+---@param nid string
+local function cost_of(job, nid)
+    local c = job.cost[nid]
+    if (c) then
+        return c
+    end
+    local children = job.any_children[nid]
+    if (children) then
+        -- a fluid at any temperature: its temperatures, by how much of each the plan makes
+        local sum, w = 0, 0
+        for _, cid in ipairs(children) do
+            local m = job.made[cid] or 0
+            if (cid == job.id or job.counted[cid]) then
+                sum = sum + m * (job.cost[cid] or 0)
+            end
+            w = w + m
+        end
+        return w > 0 and sum / w or 0
+    end
+    return 0
+end
+
+--- Step 1: what the plan makes and uses of each node, row by row.
+---@param job BCE.ProdJob
+local function step_flows(job, ri)
+    local row, x = job.scan.rows[ri], job.result.row_x and job.result.row_x[ri]
+    if (x and x > 0) then
+        job.running[#job.running + 1] = ri
+        local made, used = job.made, job.used
+        for _, a in ipairs(row.amounts) do
+            if (a.amount > 0) then
+                made[a.id] = (made[a.id] or 0) + a.amount * x
+            else
+                used[a.id] = (used[a.id] or 0) - a.amount * x
+                if (a.node.type == "any" and not job.any_children[a.id]) then
+                    local list = {}
+                    for _, child in ipairs(a.node.children or {}) do
+                        list[#list + 1] = api.node.get_id(child)
+                    end
+                    job.any_children[a.id] = list
+                end
+            end
+        end
+    end
+    return #row.amounts + 1
+end
+
+--- What a building takes of a fluid at any temperature comes out of its temperatures, by how
+--- much of each the plan makes.
+---@param job BCE.ProdJob
+local function spread_any(job)
+    local made, used = job.made, job.used
+    for aid, children in pairs(job.any_children) do
+        local total = 0
+        for _, cid in ipairs(children) do
+            total = total + (made[cid] or 0)
+        end
+        if (total > 0) then
+            for _, cid in ipairs(children) do
+                local m = made[cid] or 0
+                if (m > 0) then
+                    used[cid] = (used[cid] or 0) + used[aid] * m / total
+                end
+            end
+        end
+    end
+end
+
+--- Step 2: the products each running building is charged to, with their weights.
+---@param job BCE.ProdJob
+local function step_charge(job, ri)
+    local row = job.scan.rows[ri]
+    if (row.is_target) then
+        return 1
+    end
+    local x = job.result.row_x[ri]
+    local made, used = job.made, job.used
+    local binding, all = {}, {}
+    local wb, wa = 0, 0
+    for _, a in ipairs(row.amounts) do
+        if (a.amount > 0 and a.id ~= job.id and job.counted[a.id] and (used[a.id] or 0) > 0) then
+            local u = math.min(1, used[a.id] / made[a.id])
+            local w = a.amount * x
+            if (u > 0.999) then
+                binding[#binding + 1] = { id = a.id, w = w }
+                wb = wb + w
+            end
+            all[#all + 1] = { id = a.id, w = w * u }
+            wa = wa + w * u
+        end
+    end
+    local list, total = binding, wb
+    if (#binding == 0) then
+        list, total = all, wa
+    end
+    if (total > 0) then
+        for _, c in ipairs(list) do
+            c.w = c.w / total
+        end
+        job.charge[ri] = list
+    end
+    return #row.amounts + 1
+end
+
+--- Step 3, repeated: one building's draw from what its inputs cost, passed on to its products.
+---@param job BCE.ProdJob
+local function step_pass(job, ri)
+    local row, x = job.scan.rows[ri], job.result.row_x[ri]
+    local total = 0
+    for _, a in ipairs(row.amounts) do
+        if (a.amount < 0) then
+            local c = cost_of(job, a.id)
+            if (c > 0) then
+                total = total - a.amount * x * c
+            end
+        end
+    end
+    job.draw[ri] = total
+    local charged = job.charged
+    for _, c in ipairs(job.charge[ri] or {}) do
+        charged[c.id] = (charged[c.id] or 0) + total * c.w
+    end
+    return #row.amounts + 1
+end
+
+--- The end of a pass: new costs. True when nothing changed.
+---@param job BCE.ProdJob
+---@return boolean
+local function end_pass(job)
+    local cost, charged = job.cost, job.charged
+    local change = 0
+    for nid, v in pairs(charged) do
+        local new = v / job.used[nid]
+        local old = cost[nid] or 0
+        change = math.max(change, math.abs(new - old) / math.max(1, math.abs(new)))
+        cost[nid] = new
+    end
+    for nid, old in pairs(cost) do
+        if (nid ~= job.id and not charged[nid] and old ~= 0) then
+            cost[nid] = nil
+            change = 1
+        end
+    end
+    job.charged = {}
+    return change < 1e-9
+end
+
+--- Step 4: a group that pulls on the item, if it takes a productivity module.
+---@param job BCE.ProdJob
+local function step_modules(job, ri, surface)
+    local d = job.draw[ri]
+    local row = job.scan.rows[ri]
+    local result = job.result
+    local have = result.row_have and result.row_have[ri] or row.count_max
+    local info = have > 0 and prod_info(row.conf, job.force, surface, job.modules) or nil
+    if (info) then
+        -- its draw without its own modules, then with every slot filled
+        local none = d * (1 + info.p_now) / (1 + info.p_none)
+        local saves = none - d * (1 + info.p_now) / (1 + info.p_max)
+        local modules = info.slots * math.ceil(have - 1e-6)
+        local status = "part"
+        if (info.p_now >= info.p_max - 1e-6) then
+            status = "full"
+        elseif (info.p_now <= info.p_none + 1e-6) then
+            status = "none"
+        end
+        local products = {}
+        for _, a in ipairs(row.amounts) do
+            if (a.amount > 0 and job.counted[a.id]) then
+                products[#products + 1] = a.id
+            end
+        end
+        job.list[#job.list + 1] = { ri = ri, row = row, have = have, draw = d, saves = saves, modules = modules,
+            per_module = modules > 0 and saves / modules or 0, status = status, info = info, products = products }
+    end
+    return PROD_INFO_WORK
+end
+
+--- Runs a job for up to `budget` work units. True when it's done: the answer is in job.list,
+--- job.pulling and job.settled.
+---@param job BCE.ProdJob
+---@param budget number
+---@return boolean
+function detail.productivity_step(job, budget)
+    local rows = job.scan.rows
+    local surface = game.surfaces[job.scan.surface_index]
+    while (budget > 0 and job.phase ~= "done") do
+        local used = 0
+        if (job.phase == "flows") then
+            if (job.i > #rows) then
+                spread_any(job)
+                job.phase, job.i = "charge", 1
+            else
+                used = step_flows(job, job.i)
+                job.i = job.i + 1
+            end
+        elseif (job.phase == "charge") then
+            if (job.i > #job.running) then
+                job.phase, job.i = "pass", 1
+            else
+                used = step_charge(job, job.running[job.i])
+                job.i = job.i + 1
+            end
+        elseif (job.phase == "pass") then
+            if (job.i > #job.running) then
+                job.passes = job.passes + 1
+                job.i = 1
+                local still = end_pass(job)
+                if (still or job.passes >= MAX_PASSES) then
+                    job.settled = still
+                    for _, ri in ipairs(job.running) do
+                        if (job.draw[ri] > 1e-9) then
+                            job.pull[#job.pull + 1] = ri
+                        end
+                    end
+                    job.pulling = #job.pull
+                    job.modules = unlocked_prod_modules(job.force)
+                    job.phase = "modules"
+                end
+            else
+                used = step_pass(job, job.running[job.i])
+                job.i = job.i + 1
+            end
+        elseif (job.phase == "modules") then
+            if (job.i > #job.pull) then
+                table.sort(job.list, function(a, b)
+                    if (a.per_module ~= b.per_module) then return a.per_module > b.per_module end
+                    return a.ri < b.ri
+                end)
+                -- the working tables aren't needed any more
+                job.made, job.used, job.charge, job.cost, job.charged, job.any_children = nil, nil, nil, nil, nil, nil
+                job.phase = "done"
+            else
+                used = step_modules(job, job.pull[job.i], surface)
+                job.i = job.i + 1
+            end
+        end
+        used = math.max(used, 1)
+        budget = budget - used
+        job.work = job.work + used
+    end
+    return job.phase == "done"
+end
+
+--- All of it at once (tests).
+---@param scan BCE.Scan
+---@param result BCE.Result
+---@param id string
+---@param force LuaForce
+---@return BCE.ProdRow[] list
+---@return integer pulling
+---@return boolean settled
+---@return integer work
+function detail.productivity(scan, result, id, force)
+    local job = detail.productivity_start(scan, result, id, force)
+    detail.productivity_step(job, math.huge)
+    return job.list, job.pulling, job.settled, job.work
 end
 
 return detail

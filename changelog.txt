@@ -1,4 +1,15 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.1.0
+Date: 2026-11-23
+  Features:
+    - Item report: a Productivity section lists the building groups that pull on the item,
+      directly or through what they use, and take a productivity module you have unlocked. It
+      shows how much of the item each costs per second, how much filling its slots with the best
+      module saves, and that saving per module, best first. Full groups stay in the list, so you
+      can check that your modules are in the best spots
+  Changes:
+    - Item tooltips in item reports start with the item's name
+---------------------------------------------------------------------------------------------------
 Version: 1.0.0
 Date: 2026-11-21
   Changes:

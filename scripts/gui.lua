@@ -1293,6 +1293,7 @@ local function status_caption(result, short, compact)
 end
 
 local render_detail ---@type fun(parent: LuaGuiElement, s: BCE.PlayerStorage, result: BCE.Result?)
+local render_prod ---@type fun(s: BCE.PlayerStorage)
 
 -- ---------------------------------------------------------------------------
 -- item report
@@ -1466,6 +1467,12 @@ function gui.refresh_targets(player)
     end
 end
 
+--- Redraw the report's Productivity section (its job is done).
+---@param player LuaPlayer
+function gui.update_prod(player)
+    render_prod(gui.get_storage(player))
+end
+
 --- Show the report of an item in its pane (nil: close it).
 ---@param player LuaPlayer
 ---@param id string?
@@ -1505,7 +1512,8 @@ end
 ---@param item BCE.Item?
 ---@param extra LocalisedString? a line above the coverage
 local function detail_item_button(node, id, item, extra)
-    local button = api.gui.gui_button(api.node.gui_default(node))
+    local data = api.gui.gui_button_and_text(api.node.gui_default(node), nil)
+    local button = data.button
     local tip = { "" }
     -- the icon's own tooltip is often empty (the item tooltip comes from elem_tooltip)
     local function line(text)
@@ -1513,6 +1521,10 @@ local function detail_item_button(node, id, item, extra)
             tip[#tip + 1] = "\n"
         end
         tip[#tip + 1] = text
+    end
+    -- its name first, like the report header
+    if (data.text and data.text ~= "") then
+        line(data.text)
     end
     if (button.tooltip and button.tooltip ~= "") then
         line(button.tooltip)
@@ -1631,7 +1643,10 @@ local function waiting_cell(live, items)
             flow[#flow + 1] = detail_item_button(w.node, w.id, items[w.id], tip)
         else
             -- no node for it in the scan: just its icon
-            flow[#flow + 1] = { type = "label", caption = w.icon, tooltip = tip }
+            local t, n = w.icon:match("^%[(%a+)=(.+)%]$")
+            local proto = t and prototypes[t] and prototypes[t][n]
+            local name = proto and proto.localised_name
+            flow[#flow + 1] = { type = "label", caption = w.icon, tooltip = name and { "", name, "\n", tip } or tip }
         end
     end
     return flow
@@ -1717,11 +1732,109 @@ local function detail_table(parent, caption, help, headers)
     local row = { { type = "label", caption = { "", caption, " [img=info]" },
         tooltip = { "gui.bottleneck-calc-extreme-help-" .. help }, style = "bold_label" } }
     for i, h in ipairs(headers) do
-        row[i + 1] = { type = "label", caption = h, style_mods = { font_color = color_grey } }
+        -- { caption, help = key }: a header with its own info icon
+        if (h.help) then
+            row[i + 1] = { type = "label", caption = { "", h[1], " [img=info]" }, style_mods = { font_color = color_grey },
+                tooltip = { "gui.bottleneck-calc-extreme-help-" .. h.help } }
+        else
+            row[i + 1] = { type = "label", caption = h, style_mods = { font_color = color_grey } }
+        end
     end
     detail_gap(row[2])
     flib_gui.add(tbl, row)
     return tbl
+end
+
+--- The report's Productivity section: "calculating" until its job is done, then the list.
+---@param s BCE.PlayerStorage
+render_prod = function(s)
+    local holder = s.gui and s.gui.flow_prod
+    if (not holder or not holder.valid) then
+        return
+    end
+    holder.clear()
+    local job, result, id = s.prod_job, s.result, s.detail_item
+    if (not job or job.result ~= result or job.id ~= id) then
+        return
+    end
+    if (job.phase ~= "done") then
+        detail_separator(holder)
+        detail_caption(holder, { "gui.bottleneck-calc-extreme-detail-prod" }, "prod")
+        flib_gui.add(holder, { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-prod-calculating" },
+            style_mods = { font_color = color_grey } })
+        return
+    end
+    if (job.pulling == 0) then
+        return
+    end
+    local items = {} ---@type table<string, BCE.Item>
+    for _, e in ipairs(result.items) do
+        items[e.id] = e
+    end
+    local ui = api.node.gui_default(items[id].node)
+    local function amt(x)
+        return api.gui.gui_amount_text(ui, x)
+    end
+    local compact = s.is_pinned == true
+    do
+        detail_separator(holder)
+        if (#job.list == 0) then
+            detail_caption(holder, { "gui.bottleneck-calc-extreme-detail-prod" }, "prod")
+            flib_gui.add(holder, { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-no-prod" } })
+        else
+            local headers
+            if (compact) then
+                headers = { { "gui.bottleneck-calc-extreme-detail-col-per-module" },
+                    { { "gui.bottleneck-calc-extreme-detail-col-modules" }, help = "prod-modules" }, { "gui.bottleneck-calc-extreme-detail-col-status" } }
+            else
+                headers = { { "gui.bottleneck-calc-extreme-detail-col-draws" }, { "gui.bottleneck-calc-extreme-detail-col-saves" },
+                    { "gui.bottleneck-calc-extreme-detail-col-per-module" }, { { "gui.bottleneck-calc-extreme-detail-col-modules" }, help = "prod-modules" },
+                    { "gui.bottleneck-calc-extreme-detail-col-status" }, { "gui.bottleneck-calc-extreme-detail-col-for" } }
+            end
+            local tbl = detail_table(holder, { "gui.bottleneck-calc-extreme-detail-prod" }, "prod", headers)
+            for c = 2, compact and 2 or 4 do
+                tbl.style.column_alignments[c] = "right"
+            end
+            local status_color = { full = color_green, part = color_yellow, none = color_grey }
+            for i, r in ipairs(job.list) do
+                if (i > DETAIL_ROWS) then
+                    flib_gui.add(holder, { type = "label", caption = { "gui.bottleneck-calc-extreme-more", tostring(#job.list - DETAIL_ROWS) } })
+                    break
+                end
+                local icons = detail_row_icons({ ri = r.ri, row = r.row, have = r.have })
+                local m = r.info.module
+                local modules = { type = "sprite-button", style = "transparent_slot", style_mods = { size = 32 },
+                    sprite = "item/" .. m.name, number = r.modules, ignored_by_interaction = true,
+                    tooltip = { "gui.bottleneck-calc-extreme-detail-modules-tooltip", m.localised_name,
+                        tostring(r.info.slots), tostring(math.ceil(r.have - 1e-6)) } }
+                local status = { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-status-" .. r.status },
+                    style_mods = { font_color = status_color[r.status] } }
+                local per_module = { type = "label", caption = amt(r.per_module) }
+                if (compact) then
+                    flib_gui.add(tbl, { icons, detail_gap(per_module), modules, status })
+                else
+                    local makes = { type = "flow", style = "packed_horizontal_flow", style_mods = { vertical_align = "center" } }
+                    for k, pid in ipairs(r.products) do
+                        if (k > 4) then
+                            makes[#makes + 1] = { type = "label", caption = "…" }
+                            break
+                        end
+                        local button = detail_item_button(items[pid].node, pid, items[pid])
+                        if (pid == id) then
+                            button.style = "flib_slot_button_green"
+                        end
+                        makes[#makes + 1] = button
+                    end
+                    flib_gui.add(tbl, { icons, detail_gap({ type = "label", caption = amt(r.draw) }),
+                        { type = "label", caption = amt(r.saves) }, per_module, modules, status, makes })
+                end
+            end
+        end
+        if (not job.settled) then
+            flib_gui.add(holder, { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-prod-loop" },
+                style_mods = { font_color = color_grey, single_line = false } })
+        end
+    end
 end
 
 ---@param parent LuaGuiElement
@@ -1967,6 +2080,23 @@ render_detail = function(parent, s, result)
         -- the whole report scrolls sideways when it is too wide
         flib_gui.add(parent, flow)
     end
+
+    -- where productivity modules cut the demand for it the most: in its own flow, filled in
+    -- once its job is done (on a big base that takes a few dozen ticks)
+    s.gui.flow_prod = parent.add({ type = "flow", direction = "vertical" })
+    local player = game.get_player(parent.player_index)
+    if (player and item and item.needed > 0) then
+        local job = s.prod_job
+        if (not job or job.result ~= result or job.id ~= d.id) then
+            job = detail.productivity_start(s.scan, result, d.id, player.force)
+            s.prod_job = job
+            -- a small one is done right away, without a "calculating" flash
+            detail.productivity_step(job, detail.PROD_WORK_PER_TICK)
+        end
+    else
+        s.prod_job = nil
+    end
+    render_prod(s)
 end
 
 ---@param player LuaPlayer

@@ -354,6 +354,18 @@ script.on_event(defines.events.on_tick, function(e)
                 gui.update_progress(player, progress_caption(built))
             end
         end
+        -- the report's Productivity section, a little each tick
+        local job = s.prod_job
+        if (job and job.phase ~= "done") then
+            if (job.result ~= s.result or job.id ~= s.detail_item) then
+                s.prod_job = nil
+            elseif (detail.productivity_step(job, detail.PROD_WORK_PER_TICK)) then
+                local player = game.get_player(player_index)
+                if (player and player.valid) then
+                    gui.update_prod(player)
+                end
+            end
+        end
     end
 end)
 
