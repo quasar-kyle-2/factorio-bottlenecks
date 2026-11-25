@@ -1,4 +1,10 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.1.2
+Date: 2026-11-25
+  Changes:
+    - Item report: in Made by, building groups left below 100% while another group making the
+      item runs past 100% get an info icon by "needed", explaining why they sit idle
+---------------------------------------------------------------------------------------------------
 Version: 1.1.1
 Date: 2026-11-24
   Changes:

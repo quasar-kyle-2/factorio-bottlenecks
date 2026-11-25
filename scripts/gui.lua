@@ -1691,6 +1691,31 @@ local function runs_cell(d)
         tooltip = { "gui.bottleneck-calc-extreme-detail-runs-tooltip" } }
 end
 
+--- A producer's share of its buildings in use: x / have (huge when it has none but runs).
+local function runs_share(d)
+    if (d.have > 0) then
+        return d.x / d.have
+    end
+    return d.x > 0 and math.huge or 0
+end
+
+--- A producer runs below its buildings while another producer of the same item runs past
+--- theirs: the solver chose not to use these, because feeding them would grow the factory more.
+---@param p table
+---@param producers table[]
+---@return boolean
+local function runs_under_while_others_over(p, producers)
+    if (not p.x or p.row.is_target or p.have <= 0 or runs_share(p) >= 1 - 1e-6) then
+        return false
+    end
+    for _, q in ipairs(producers) do
+        if (q ~= p and q.x and not q.row.is_target and runs_share(q) > 1 + 1e-6) then
+            return true
+        end
+    end
+    return false
+end
+
 --- The horizontal rule over each report section.
 ---@param parent LuaGuiElement
 local function detail_separator(parent)
@@ -2025,17 +2050,21 @@ render_detail = function(parent, s, result)
                     runs_cell(p),
                     short,
                 })
-            else flib_gui.add(tbl, {
-                icons,
-                detail_gap({ type = "label", caption = amt(p.per_building * p.have) }),
-                { type = "label", caption = p.x and amt(p.rate) or "",
-                    tooltip = not p.x and { "gui.bottleneck-calc-extreme-detail-not-for-targets-tooltip-made" } or nil },
-                runs_cell(p),
-                also,
-                short,
-                { type = "label", caption = live_caption(p.live, false) },
-                waiting_cell(p.live, items),
-            }) end
+            else
+                local held_back = runs_under_while_others_over(p, d.producers)
+                flib_gui.add(tbl, {
+                    icons,
+                    detail_gap({ type = "label", caption = amt(p.per_building * p.have) }),
+                    { type = "label", caption = p.x and (held_back and { "", "[img=info] ", amt(p.rate) } or amt(p.rate)) or "",
+                        tooltip = not p.x and { "gui.bottleneck-calc-extreme-detail-not-for-targets-tooltip-made" }
+                            or (held_back and { "gui.bottleneck-calc-extreme-detail-held-back-tooltip" }) or nil },
+                    runs_cell(p),
+                    also,
+                    short,
+                    { type = "label", caption = live_caption(p.live, false) },
+                    waiting_cell(p.live, items),
+                })
+            end
         end
     end
 
