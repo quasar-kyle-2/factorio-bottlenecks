@@ -495,25 +495,49 @@ end
 
 --- What an item costs in the reported item, per unit made, through the plan's flows. A
 --- building's draw goes to the products that make it run: the ones the plan uses all of
---- (byproducts it makes too much of come free). Solved by repeating until nothing changes.
+--- (byproducts it makes too much of come free).
+---
+--- Each cost is a sum over other costs, so they make a set of linear equations. They're solved
+--- exactly, a loop at a time: the items that feed each other (directly or around a loop) are
+--- found first, then solved in order, each loop as one system once what feeds it is known (in
+--- Py most of a base is one loop of hundreds of items, through barrels, ash and the like). A loop that makes more than it uses up has no answer: its costs grow without end.
+--- Those get a fixed number of rounds instead, and the report says the numbers are rough.
 ---
 --- It runs as a job, a little each tick (a big base takes about a second in one go). The job is
 --- plain data, so it can sit in storage: start it, then step it until it says it's done.
 
---- Work units a step gets per tick. A big Py base takes about 140k for a report, about 0.1 s in
---- one go on a fast PC and about 1 s on a busy game: 2500 a tick spreads that over about a
---- second, at roughly half the frame rate while it runs.
+--- Work units a step gets per tick. A big Py base takes about 170k for a report, about 0.15 s in
+--- one go on a fast PC: 2500 a tick spreads that over about a second, at roughly half the frame
+--- rate while it runs.
 detail.PROD_WORK_PER_TICK = 2500
 --- Work units one group's module check counts for.
 local PROD_INFO_WORK = 40
+--- Rounds a loop with no answer gets.
 local MAX_PASSES = 200
+
+---@class BCE.ProdExpr a + sum of f[k] * cost[v[k]]
+---@field a number
+---@field v string[]
+---@field f number[]
+---@field at table<string, integer> where each node is in v
+
+---@class BCE.ProdSolve one loop being solved
+---@field m string[] its nodes
+---@field eqs table<string, { a: number, t: table<string, number> }> each node's equation, among the loop's nodes
+---@field users table<string, table<string, true>> the equations each node is in
+---@field nt table<string, integer> terms in each equation
+---@field nu table<string, integer> equations each node is in, not counting its own
+---@field done table<string, true>
+---@field order string[] the nodes solved for, in order
+---@field hs number[] heap: scores
+---@field hn string[] heap: nodes
 
 ---@class BCE.ProdJob
 ---@field id string
 ---@field scan BCE.Scan
 ---@field result BCE.Result
 ---@field force LuaForce
----@field phase "flows" | "charge" | "pass" | "modules" | "done"
+---@field phase "flows" | "charge" | "equations" | "order" | "solve" | "draw" | "modules" | "done"
 ---@field i integer
 ---@field work integer units done so far
 ---@field counted table<string, true>
@@ -522,15 +546,19 @@ local MAX_PASSES = 200
 ---@field running integer[]
 ---@field any_children table<string, string[]>
 ---@field charge table<integer, { id: string, w: number }[]>
+---@field vars string[] the nodes with a cost to work out, in the order they came up
+---@field eq table<string, BCE.ProdExpr> each one's cost, from the others
+---@field rexpr table<integer, BCE.ProdExpr> each running building's draw, from the costs
+---@field ord table? the loop finder's state
+---@field sccs string[][] the loops (and single nodes), each after the ones it uses
+---@field sol BCE.ProdSolve?
 ---@field cost table<string, number>
 ---@field draw table<integer, number>
----@field charged table<string, number>
----@field passes integer
 ---@field pull integer[] rows that pull on the item
 ---@field modules LuaItemPrototype[]? unlocked productivity modules
 ---@field list BCE.ProdRow[] the answer, best use of a module first
 ---@field pulling integer groups that pull on it at all
----@field settled boolean false: a loop kept the draws from settling
+---@field settled boolean false: a loop makes more than it uses up, so its costs are rough
 
 ---@param scan BCE.Scan
 ---@param result BCE.Result
@@ -546,30 +574,8 @@ function detail.productivity_start(scan, result, id, force)
     end
     return { id = id, scan = scan, result = result, force = force, phase = "flows", i = 1, work = 0,
         counted = counted, made = {}, used = {}, running = {}, any_children = {}, charge = {},
-        cost = { [id] = 1 }, draw = {}, charged = {}, passes = 0, pull = {}, list = {}, pulling = 0, settled = false }
-end
-
----@param job BCE.ProdJob
----@param nid string
-local function cost_of(job, nid)
-    local c = job.cost[nid]
-    if (c) then
-        return c
-    end
-    local children = job.any_children[nid]
-    if (children) then
-        -- a fluid at any temperature: its temperatures, by how much of each the plan makes
-        local sum, w = 0, 0
-        for _, cid in ipairs(children) do
-            local m = job.made[cid] or 0
-            if (cid == job.id or job.counted[cid]) then
-                sum = sum + m * (job.cost[cid] or 0)
-            end
-            w = w + m
-        end
-        return w > 0 and sum / w or 0
-    end
-    return 0
+        vars = {}, eq = {}, rexpr = {}, sccs = {}, cost = { [id] = 1 }, draw = {}, pull = {}, list = {},
+        pulling = 0, settled = true }
 end
 
 --- Step 1: what the plan makes and uses of each node, row by row.
@@ -646,58 +652,376 @@ local function step_charge(job, ri)
         list, total = all, wa
     end
     if (total > 0) then
+        local eq = job.eq
         for _, c in ipairs(list) do
             c.w = c.w / total
+            if (not eq[c.id]) then
+                eq[c.id] = { a = 0, v = {}, f = {}, at = {} }
+                job.vars[#job.vars + 1] = c.id
+            end
         end
         job.charge[ri] = list
     end
     return #row.amounts + 1
 end
 
---- Step 3, repeated: one building's draw from what its inputs cost, passed on to its products.
+---@param e BCE.ProdExpr
+---@param v string
+---@param f number
+local function expr_add(e, v, f)
+    local k = e.at[v]
+    if (k) then
+        e.f[k] = e.f[k] + f
+    else
+        k = #e.v + 1
+        e.v[k], e.f[k], e.at[v] = v, f, k
+    end
+end
+
+--- Step 3: a running building's draw as a sum over costs, added to the costs of the products
+--- it's charged to.
 ---@param job BCE.ProdJob
-local function step_pass(job, ri)
+local function step_equations(job, ri)
     local row, x = job.scan.rows[ri], job.result.row_x[ri]
-    local total = 0
+    local eq, id = job.eq, job.id
+    local r = { a = 0, v = {}, f = {}, at = {} }
     for _, a in ipairs(row.amounts) do
         if (a.amount < 0) then
-            local c = cost_of(job, a.id)
-            if (c > 0) then
-                total = total - a.amount * x * c
+            local rate = -a.amount * x
+            local children = job.any_children[a.id]
+            if (a.id == id) then
+                r.a = r.a + rate
+            elseif (eq[a.id]) then
+                expr_add(r, a.id, rate)
+            elseif (children) then
+                -- a fluid at any temperature: its temperatures, by how much of each the plan makes
+                local w = 0
+                for _, cid in ipairs(children) do
+                    w = w + (job.made[cid] or 0)
+                end
+                if (w > 0) then
+                    for _, cid in ipairs(children) do
+                        local m = job.made[cid] or 0
+                        if (m > 0 and cid == id) then
+                            r.a = r.a + rate * m / w
+                        elseif (m > 0 and eq[cid]) then
+                            expr_add(r, cid, rate * m / w)
+                        end
+                    end
+                end
             end
         end
     end
-    job.draw[ri] = total
-    local charged = job.charged
-    for _, c in ipairs(job.charge[ri] or {}) do
-        charged[c.id] = (charged[c.id] or 0) + total * c.w
-    end
-    return #row.amounts + 1
-end
-
---- The end of a pass: new costs. True when nothing changed.
----@param job BCE.ProdJob
----@return boolean
-local function end_pass(job)
-    local cost, charged = job.cost, job.charged
-    local change = 0
-    for nid, v in pairs(charged) do
-        local new = v / job.used[nid]
-        local old = cost[nid] or 0
-        change = math.max(change, math.abs(new - old) / math.max(1, math.abs(new)))
-        cost[nid] = new
-    end
-    for nid, old in pairs(cost) do
-        if (nid ~= job.id and not charged[nid] and old ~= 0) then
-            cost[nid] = nil
-            change = 1
+    job.rexpr[ri] = r
+    local charge = job.charge[ri] or {}
+    for _, c in ipairs(charge) do
+        local e, s = eq[c.id], c.w / job.used[c.id]
+        e.a = e.a + r.a * s
+        for k, v in ipairs(r.v) do
+            expr_add(e, v, r.f[k] * s)
         end
     end
-    job.charged = {}
-    return change < 1e-9
+    return #row.amounts + 1 + #charge * (#r.v + 1)
 end
 
---- Step 4: a group that pulls on the item, if it takes a productivity module.
+---@param o table
+---@param v string
+local function ord_visit(o, v)
+    o.n = o.n + 1
+    o.index[v], o.low[v] = o.n, o.n
+    o.stack[#o.stack + 1], o.on[v] = v, true
+    o.cs[#o.cs + 1], o.ep[v] = v, 1
+end
+
+--- Step 4: the loops, by Tarjan's algorithm: a node's equation uses the nodes in it, and a loop
+--- is a set of nodes that all use each other. One move at a time, so it can stop anywhere. The
+--- loops come out each after the ones it uses.
+---@param job BCE.ProdJob
+---@return boolean done
+local function step_order(job)
+    local o = job.ord
+    if (not o) then
+        o = { index = {}, low = {}, on = {}, stack = {}, cs = {}, ep = {}, n = 0, vi = 1 }
+        job.ord = o
+    end
+    local eq, cs = job.eq, o.cs
+    if (#cs == 0) then
+        local vars = job.vars
+        while (o.vi <= #vars and o.index[vars[o.vi]]) do
+            o.vi = o.vi + 1
+        end
+        if (o.vi > #vars) then
+            job.ord = nil
+            return true
+        end
+        ord_visit(o, vars[o.vi])
+        return false
+    end
+    local v = cs[#cs]
+    local e = eq[v]
+    local k = o.ep[v]
+    if (k <= #e.v) then
+        o.ep[v] = k + 1
+        local w = e.v[k]
+        if (not o.index[w]) then
+            ord_visit(o, w)
+        elseif (o.on[w] and o.index[w] < o.low[v]) then
+            o.low[v] = o.index[w]
+        end
+        return false
+    end
+    cs[#cs] = nil
+    if (o.low[v] == o.index[v]) then
+        local scc = {}
+        repeat
+            local w = o.stack[#o.stack]
+            o.stack[#o.stack], o.on[w] = nil, nil
+            scc[#scc + 1] = w
+        until (w == v)
+        job.sccs[#job.sccs + 1] = scc
+    end
+    local u = cs[#cs]
+    if (u and o.low[v] < o.low[u]) then
+        o.low[u] = o.low[v]
+    end
+    return false
+end
+
+--- A loop with no answer: a fixed number of rounds from zero, as if it were settling.
+---@param job BCE.ProdJob
+---@param m string[]
+---@return integer work
+local function solve_rough(job, m)
+    local eq, cost = job.eq, job.cost
+    local inside = {}
+    for _, n in ipairs(m) do
+        inside[n] = true
+        cost[n] = 0
+    end
+    local work = 0
+    for _ = 1, MAX_PASSES do
+        local new = {}
+        for _, n in ipairs(m) do
+            local e = eq[n]
+            local s = e.a
+            for k, v in ipairs(e.v) do
+                s = s + e.f[k] * (cost[v] or 0)
+            end
+            new[n] = s
+            work = work + #e.v + 1
+        end
+        for n, s in pairs(new) do
+            cost[n] = s
+        end
+    end
+    job.settled = false
+    return work
+end
+
+--- A min-heap of (score, node) in two arrays. A node is pushed again when its score changes;
+--- the old entries are skipped when they come up.
+---@param sol BCE.ProdSolve
+---@param score number
+---@param n string
+local function heap_push(sol, score, n)
+    local hs, hn = sol.hs, sol.hn
+    local i = #hs + 1
+    while (i > 1) do
+        local up = math.floor(i / 2)
+        if (hs[up] <= score) then
+            break
+        end
+        hs[i], hn[i] = hs[up], hn[up]
+        i = up
+    end
+    hs[i], hn[i] = score, n
+end
+
+---@param sol BCE.ProdSolve
+---@return number score
+---@return string n
+local function heap_pop(sol)
+    local hs, hn = sol.hs, sol.hn
+    local score, n = hs[1], hn[1]
+    local size = #hs
+    local ls, ln = hs[size], hn[size]
+    hs[size], hn[size] = nil, nil
+    size = size - 1
+    if (size > 0) then
+        local i = 1
+        while (true) do
+            local c = 2 * i
+            if (c > size) then
+                break
+            end
+            if (c < size and hs[c + 1] < hs[c]) then
+                c = c + 1
+            end
+            if (hs[c] >= ls) then
+                break
+            end
+            hs[i], hn[i] = hs[c], hn[c]
+            i = c
+        end
+        hs[i], hn[i] = ls, ln
+    end
+    return score, n
+end
+
+--- Step 5, a piece at a time: the costs of the next loop (or single node), once the ones it uses
+--- are known. A loop is solved by substitution, one node per call: take a node's equation, solve
+--- it for that node, and put it into every equation that uses it. The node that adds the least
+--- goes first (fewest users times fewest terms), which keeps a big loop sparse. The costs then
+--- come out backwards. A loop has an answer only when every node solves with a positive divisor.
+---@param job BCE.ProdJob
+---@return integer work
+local function step_solve(job)
+    local eq, cost = job.eq, job.cost
+    local sol = job.sol
+    if (not sol) then
+        local m = job.sccs[job.i]
+        if (#m == 1 and not eq[m[1]].at[m[1]]) then
+            local e = eq[m[1]]
+            local s = e.a
+            for k, v in ipairs(e.v) do
+                s = s + e.f[k] * (cost[v] or 0)
+            end
+            cost[m[1]] = s
+            job.i = job.i + 1
+            return #e.v + 1
+        end
+        -- the loop's equations among its own nodes, with what feeds it already in
+        local inside = {}
+        for _, n in ipairs(m) do
+            inside[n] = true
+        end
+        local eqs, users, nt, nu, work = {}, {}, {}, {}, 0
+        for _, n in ipairs(m) do
+            users[n], nu[n] = {}, 0
+        end
+        for _, n in ipairs(m) do
+            local e = eq[n]
+            local t, c, s = {}, 0, e.a
+            for k, v in ipairs(e.v) do
+                if (inside[v]) then
+                    t[v] = e.f[k]
+                    c = c + 1
+                    if (v ~= n) then
+                        users[v][n] = true
+                        nu[v] = nu[v] + 1
+                    end
+                else
+                    s = s + e.f[k] * (cost[v] or 0)
+                end
+            end
+            eqs[n], nt[n] = { a = s, t = t }, c
+            work = work + #e.v + 1
+        end
+        sol = { m = m, eqs = eqs, users = users, nt = nt, nu = nu, done = {}, order = {}, hs = {}, hn = {} }
+        for _, n in ipairs(m) do
+            heap_push(sol, nu[n] * nt[n], n)
+        end
+        job.sol = sol
+        return work + #m
+    end
+    local m, eqs, users, nt, nu, done = sol.m, sol.eqs, sol.users, sol.nt, sol.nu, sol.done
+    if (#sol.order < #m) then
+        -- the node that adds the least
+        local p, work = nil, 0
+        repeat
+            local score, n = heap_pop(sol)
+            work = work + 1
+            if (not done[n] and score == nu[n] * nt[n]) then
+                p = n
+            end
+        until (p)
+        local e = eqs[p]
+        local d = 1 - (e.t[p] or 0)
+        if (d < 1e-12) then
+            job.sol = nil
+            job.i = job.i + 1
+            return #m + solve_rough(job, m)
+        end
+        if (e.t[p]) then
+            e.t[p] = nil
+            nt[p] = nt[p] - 1
+        end
+        e.a = e.a / d
+        local changed = {}
+        for v, f in pairs(e.t) do
+            e.t[v] = f / d
+            users[v][p] = nil
+            nu[v] = nu[v] - 1
+            changed[v] = true
+        end
+        for n in pairs(users[p]) do
+            changed[n] = true
+            local en = eqs[n]
+            local g = en.t[p]
+            en.t[p] = nil
+            nt[n] = nt[n] - 1
+            en.a = en.a + g * e.a
+            for v, f in pairs(e.t) do
+                local old = en.t[v]
+                if (old) then
+                    en.t[v] = old + g * f
+                else
+                    en.t[v] = g * f
+                    nt[n] = nt[n] + 1
+                    if (v ~= n) then
+                        users[v][n] = true
+                        nu[v] = nu[v] + 1
+                        changed[v] = true
+                    end
+                end
+            end
+            work = work + nt[p] + 1
+        end
+        users[p], done[p] = nil, true
+        sol.order[#sol.order + 1] = p
+        for n in pairs(changed) do
+            heap_push(sol, nu[n] * nt[n], n)
+            work = work + 1
+        end
+        return work
+    end
+    -- the costs, backwards: each node's equation only has nodes solved after it
+    local x, order = {}, sol.order
+    for k = #order, 1, -1 do
+        local p = order[k]
+        local e = eqs[p]
+        local s = e.a
+        for v, f in pairs(e.t) do
+            s = s + f * x[v]
+        end
+        if (s ~= s or s == math.huge or s < -1e-9 * math.max(1, math.abs(s))) then
+            job.sol = nil
+            job.i = job.i + 1
+            return #m + solve_rough(job, m)
+        end
+        x[p] = s
+    end
+    for _, n in ipairs(m) do
+        cost[n] = math.max(0, x[n])
+    end
+    job.sol = nil
+    job.i = job.i + 1
+    return #m * 2
+end
+
+--- Step 6: each running building's draw, from the costs.
+---@param job BCE.ProdJob
+local function step_draw(job, ri)
+    local r, cost = job.rexpr[ri], job.cost
+    local s = r.a
+    for k, v in ipairs(r.v) do
+        s = s + r.f[k] * (cost[v] or 0)
+    end
+    job.draw[ri] = s
+    return #r.v + 1
+end
+
+--- Step 7: a group that pulls on the item, if it takes a productivity module.
 ---@param job BCE.ProdJob
 local function step_modules(job, ri, surface)
     local d = job.draw[ri]
@@ -748,29 +1072,40 @@ function detail.productivity_step(job, budget)
             end
         elseif (job.phase == "charge") then
             if (job.i > #job.running) then
-                job.phase, job.i = "pass", 1
+                job.phase, job.i = "equations", 1
             else
                 used = step_charge(job, job.running[job.i])
                 job.i = job.i + 1
             end
-        elseif (job.phase == "pass") then
+        elseif (job.phase == "equations") then
             if (job.i > #job.running) then
-                job.passes = job.passes + 1
-                job.i = 1
-                local still = end_pass(job)
-                if (still or job.passes >= MAX_PASSES) then
-                    job.settled = still
-                    for _, ri in ipairs(job.running) do
-                        if (job.draw[ri] > 1e-9) then
-                            job.pull[#job.pull + 1] = ri
-                        end
-                    end
-                    job.pulling = #job.pull
-                    job.modules = unlocked_prod_modules(job.force)
-                    job.phase = "modules"
-                end
+                job.phase, job.i = "order", 1
             else
-                used = step_pass(job, job.running[job.i])
+                used = step_equations(job, job.running[job.i])
+                job.i = job.i + 1
+            end
+        elseif (job.phase == "order") then
+            if (step_order(job)) then
+                job.phase, job.i = "solve", 1
+            end
+        elseif (job.phase == "solve") then
+            if (job.i > #job.sccs) then
+                job.phase, job.i = "draw", 1
+            else
+                used = step_solve(job)
+            end
+        elseif (job.phase == "draw") then
+            if (job.i > #job.running) then
+                for _, ri in ipairs(job.running) do
+                    if (job.draw[ri] > 1e-9) then
+                        job.pull[#job.pull + 1] = ri
+                    end
+                end
+                job.pulling = #job.pull
+                job.modules = unlocked_prod_modules(job.force)
+                job.phase, job.i = "modules", 1
+            else
+                used = step_draw(job, job.running[job.i])
                 job.i = job.i + 1
             end
         elseif (job.phase == "modules") then
@@ -780,7 +1115,8 @@ function detail.productivity_step(job, budget)
                     return a.ri < b.ri
                 end)
                 -- the working tables aren't needed any more
-                job.made, job.used, job.charge, job.cost, job.charged, job.any_children = nil, nil, nil, nil, nil, nil
+                job.made, job.used, job.charge, job.cost, job.any_children = nil, nil, nil, nil, nil
+                job.vars, job.eq, job.rexpr, job.sccs = nil, nil, nil, nil
                 job.phase = "done"
             else
                 used = step_modules(job, job.pull[job.i], surface)

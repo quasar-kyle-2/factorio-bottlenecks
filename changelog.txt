@@ -1,4 +1,12 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.1.1
+Date: 2026-11-24
+  Changes:
+    - Item report: the Productivity section lists as many rows as the "Maximum rows per
+      section" setting, instead of 15
+  Bugfixes:
+    - Item report: the Productivity section now calculates closed loops properly instead of displaying incorrect numbers for them and reporting that a loop didn't settle.  As a side effect, the section's calculations are a little quicker to complete.
+---------------------------------------------------------------------------------------------------
 Version: 1.1.0
 Date: 2026-11-23
   Features:

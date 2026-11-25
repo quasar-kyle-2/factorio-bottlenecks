@@ -498,7 +498,7 @@ script.on_configuration_changed(function()
         end
         -- scans hold prototypes and node ids that may be stale after mod changes
         for _, s in pairs(storage.players) do
-            s.scan, s.built, s.solved, s.result, s.gui = nil, nil, nil, nil, nil
+            s.scan, s.built, s.solved, s.result, s.gui, s.prod_job = nil, nil, nil, nil, nil, nil
             -- without a scan a stopped window would show no targets: scan again on open
             s.stopped = nil
             -- left over from 0.1.x

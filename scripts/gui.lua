@@ -1796,9 +1796,10 @@ render_prod = function(s)
                 tbl.style.column_alignments[c] = "right"
             end
             local status_color = { full = color_green, part = color_yellow, none = color_grey }
+            local max_rows = settings.get_player_settings(holder.player_index)["bottleneck-calc-extreme-max-rows"].value --[[@as integer]]
             for i, r in ipairs(job.list) do
-                if (i > DETAIL_ROWS) then
-                    flib_gui.add(holder, { type = "label", caption = { "gui.bottleneck-calc-extreme-more", tostring(#job.list - DETAIL_ROWS) } })
+                if (i > max_rows) then
+                    flib_gui.add(holder, { type = "label", caption = { "gui.bottleneck-calc-extreme-more", tostring(#job.list - max_rows) } })
                     break
                 end
                 local icons = detail_row_icons({ ri = r.ri, row = r.row, have = r.have })
