@@ -818,9 +818,15 @@ function lp.set_upper(st, j, value)
     end
     if (u == 0 and value > 0) then
         -- a locked column (upper bound 0) is kept out of the row index and its reduced costs
-        -- aren't maintained: put it back and recompute them
+        -- aren't maintained: put it back and recompute them. The rows are copied first, since a
+        -- fork (lp.fork) shares them with the state it came from.
         for i, a in pairs(st.A[j]) do
-            st.rowA[i][j] = a
+            local row = {}
+            for k, v in pairs(st.rowA[i]) do
+                row[k] = v
+            end
+            row[j] = a
+            st.rowA[i] = row
         end
         -- at 0 either way; as "at its lower bound" it stays at 0 under the new bound
         st.at_upper[j] = nil
@@ -894,6 +900,102 @@ function lp.lower_into(st, j, value, k)
     st.iterations = 0
     st.degenerate_run = 0
     return true
+end
+
+--- Adds columns to a state, solved or not, locked at 0 (lp.set_upper opens one), so the
+--- solution stays as it is. They go after the other columns: the slacks' indices (n + i) move
+--- up, nothing else does. Must not be called on a state with forks still in use.
+---@param cols table<integer, number>[] row -> coefficient, per new column
+---@param costs number[] their cost, for the first cost component (0 in the others)
+---@return integer[] indices of the new columns
+function lp.extend(st, cols, costs)
+    local k = #cols
+    local n, N = st.n, st.N
+    local new = {}
+    if (k == 0) then
+        return new
+    end
+    local function map(j)
+        return j > n and j + k or j
+    end
+    for t = 1, k do
+        local c = {}
+        for i, a in pairs(cols[t]) do
+            if (a ~= 0) then
+                c[i] = a
+            end
+        end
+        st.A[n + t] = c
+        new[t] = n + t
+    end
+    local upper, at_upper, pos = {}, {}, {}
+    for j, u in pairs(st.upper) do
+        upper[map(j)] = u
+    end
+    for t = 1, k do
+        upper[n + t] = 0
+    end
+    for j, v in pairs(st.at_upper) do
+        at_upper[map(j)] = v
+    end
+    for j, r in pairs(st.pos) do
+        pos[map(j)] = r
+    end
+    local basis = {}
+    for i, j in pairs(st.basis) do
+        basis[i] = map(j)
+    end
+    st.upper, st.at_upper, st.pos, st.basis = upper, at_upper, pos, basis
+    for kk = 1, st.K do
+        local c, d = {}, {}
+        local ck, dk = st.c[kk], st.d[kk]
+        for j = 1, N do
+            c[map(j)] = ck[j]
+            d[map(j)] = dk[j]
+        end
+        for t = 1, k do
+            c[n + t] = kk == 1 and (costs[t] or 0) or 0
+            -- not kept up to date while locked: lp.set_upper recomputes it
+            d[n + t] = 0
+        end
+        st.c[kk], st.d[kk] = c, d
+    end
+    st.n, st.N = n + k, N + k
+    st.max_iterations = 30 * st.N + 1000
+    return new
+end
+
+local function copy(t)
+    local r = {}
+    for k, v in pairs(t) do
+        r[k] = v
+    end
+    return r
+end
+
+--- A copy of a solved state to try a change on (a what-if), without touching the original.
+--- Only what the solver changes is copied: the matrix, costs and factorization entries are
+--- shared, so this is far cheaper than a deep copy. Neither copy may be changed by anything but
+--- lp.step, lp.set_upper and lp.lower_into.
+---@return table
+function lp.fork(st)
+    local f = {}
+    for k, v in pairs(st) do
+        f[k] = v
+    end
+    f.beta = copy(st.beta)
+    f.basis = copy(st.basis)
+    f.pos = copy(st.pos)
+    f.at_upper = copy(st.at_upper)
+    f.upper = copy(st.upper)
+    f.etas = copy(st.etas)
+    f.rowA = copy(st.rowA)
+    local d = {}
+    for k = 1, st.K do
+        d[k] = copy(st.d[k])
+    end
+    f.d = d
+    return f
 end
 
 ---@return number

@@ -60,11 +60,12 @@ local ignored_any_types = {
     ["any-fluid-fuel"] = true,
 }
 
---- Waste items, treated as unlimited: what burning a fuel leaves behind, when nothing refills
---- it into that fuel (ash, spent nuclear fuel). There is always more than enough of it, and
---- getting rid of it isn't a real use. Empty canisters, used batteries, used animals and the
---- like are refilled or recharged one for one into their fuel, so they stay counted. Turning
---- 10 ash into 1 coal dust is reprocessing, not refilling: ash is still waste.
+--- Waste items: what burning a fuel leaves behind, when nothing refills it into that fuel (ash,
+--- spent nuclear fuel). What a building burns is dropped from its amounts (ignored_tags), so
+--- this is about recipes: they count waste like any other item, but waste nothing makes is
+--- never given a supply. Empty canisters, used batteries, used animals and the like are
+--- refilled or recharged one for one into their fuel, so they aren't waste. Turning 10 ash into
+--- 1 coal dust is reprocessing, not refilling: ash is still waste.
 local waste_cache = nil ---@type table<string, true>?
 
 ---@return table<string, true> item name -> true
@@ -135,6 +136,26 @@ local ignored_tags = {
     ["energy-source-output"] = true,
 }
 
+--- Water at its default temperature (15°), or a temperature range that includes it: free and
+--- worthless, like an offshore pump's.
+---@param node Rates.Node
+---@return boolean
+local function is_water15(node)
+    if (node.type == "fluid" and node.fluid and node.fluid.name == "water") then
+        return node.temperature == node.fluid.default_temperature
+    end
+    local details = node.type == "any" and node.details
+    if (details and details.type == "any-fluid" and details.fluid and details.fluid.name == "water") then
+        local d = details.fluid.default_temperature
+        return (details.min_temperature == nil or details.min_temperature <= d)
+            and (details.max_temperature == nil or details.max_temperature >= d)
+    end
+    return false
+end
+
+--- Unlimited: power, heat, fuel, pollution and default-temperature water. Water at any other
+--- temperature and steam are counted, and so is recipe waste (ash a recipe makes): they take
+--- buildings to make. (track_steam false keeps steam unlimited, for the remote interface.)
 ---@param node Rates.Node
 ---@param track_steam boolean?
 ---@return boolean
@@ -144,16 +165,19 @@ local function is_ignored_node(node, track_steam)
         return true
     end
     if (t == "fluid") then
+        if (node.fluid.name == "water") then
+            return is_water15(node)
+        end
         return fluid_ignored(node.fluid.name, track_steam)
-    end
-    if (t == "item") then
-        return waste_items()[node.item.name] == true
     end
     if (t == "any") then
         local details = node.details
         if (details) then
             if (ignored_any_types[details.type]) then
                 return true
+            end
+            if (details.type == "any-fluid" and details.fluid and details.fluid.name == "water") then
+                return is_water15(node)
             end
             if (details.type == "any-fluid" and details.fluid and fluid_ignored(details.fluid.name, track_steam)) then
                 return true
@@ -163,12 +187,45 @@ local function is_ignored_node(node, track_steam)
     return false
 end
 
+--- Fuel categories with few fuels (drill heads, fuel rods) are a building's own supply, made
+--- for it: such a fuel is traced as an ordinary input. Any other fuel (coal and the like, liquid
+--- fuels) is the player's free choice and stays unlimited.
+local SPECIAL_FUEL_MAX = 8
+local fuel_count = nil ---@type table<string, integer>?
+
+---@param item LuaItemPrototype
+---@return boolean
+local function special_fuel(item)
+    if (not fuel_count) then
+        fuel_count = {}
+        for _, it in pairs(prototypes.item) do
+            local ok, cats = pcall(function() return it.fuel_categories end)
+            if (ok and cats and (it.fuel_value or 0) > 0) then
+                for _, c in pairs(cats) do
+                    fuel_count[c] = (fuel_count[c] or 0) + 1
+                end
+            end
+        end
+    end
+    local ok, cats = pcall(function() return item.fuel_categories end)
+    if (not ok or not cats or #cats == 0) then
+        return false
+    end
+    for _, c in pairs(cats) do
+        if ((fuel_count[c] or 0) > SPECIAL_FUEL_MAX) then
+            return false
+        end
+    end
+    return true
+end
+
 ---@param amounts Rates.Configuration.Amount[]
 ---@return { id: string, node: Rates.Node, amount: number }[]
 local function sum_amounts(amounts)
     local by_id, list = {}, {}
     for _, amount in ipairs(amounts) do
-        if (ignored_tags[amount.tag]) then
+        if (ignored_tags[amount.tag] and not (amount.tag == "energy-source-input" and amount.node.type == "item"
+                and amount.node.item and special_fuel(amount.node.item))) then
             goto continue
         end
         local id = api.node.get_id(amount.node)
@@ -200,6 +257,7 @@ end
 ---@field entities LuaEntity[] same order as entity_ids
 ---@field amounts { id: string, node: Rates.Node, amount: number }[]
 ---@field annotations Rates.Configuration.Annotation[]?
+---@field rent number running cost of one building per second (running_cost)
 
 ---@class BCE.Scan
 ---@field surface_index integer
@@ -209,11 +267,46 @@ end
 ---@field target_entities_without_conf integer
 ---@field planned_changes integer ghosts, queued upgrades and pending module requests counted in
 
+--- Running cost ("rent", ongoing, per building-second), YAFC's definition of work: 0.02 per item
+--- and 0.0005 per fluid unit going in or out, and 0.1 per MJ of energy (electricity, heat, fuel).
+--- Default-temperature water costs nothing to handle. A special fuel (special_fuel) is traced
+--- like an input, so it pays handling.
+---@param raw Rates.Configuration.Amount[] from get_production, energy included
+---@return number
+local function running_cost(raw)
+    local handling, joules = 0, 0
+    for _, a in ipairs(raw) do
+        local t = a.node.type
+        if (a.tag == "energy-source-input") then
+            if (t == "item" and a.node.item) then
+                if (special_fuel(a.node.item)) then
+                    handling = handling + math.abs(a.amount) * 0.02
+                else
+                    joules = joules - a.amount * (a.node.item.fuel_value or 0)
+                end
+            elseif (a.fuel_usage) then
+                joules = joules + a.fuel_usage
+            elseif (t == "fluid" and a.node.fluid and (a.node.fluid.fuel_value or 0) > 0) then
+                joules = joules - a.amount * a.node.fluid.fuel_value
+            else
+                joules = joules - a.amount
+            end
+        elseif (a.tag ~= "energy-source-output" and a.tag ~= "pollution" and t ~= "map-entity" and not is_water15(a.node)) then
+            if (t == "item") then
+                handling = handling + math.abs(a.amount) * 0.02
+            elseif (t == "fluid" or t == "any") then
+                handling = handling + math.abs(a.amount) * 0.0005
+            end
+        end
+    end
+    return handling + joules / 1e6 * 0.1
+end
+
 --- A recipe that is only for show: hidden, and makes something out of nothing. Pyanodon's dig
 --- sites run one (4000 nexelit ore per second) while their digosaurs really walk out and mine
---- the ore by script, at a rate nothing on the building tells. What it "makes" is treated as
---- unlimited, like water: other recipes may make some too, but the dig sites' share can't be
---- told, so counting only those would make it look short.
+--- the ore by script, at a rate nothing on the building tells. Its products are dropped: the
+--- item gets a supply instead, capped at what the factory really made in the last hour (see
+--- model.build).
 ---@param conf Rates.Configuration
 ---@return boolean
 local function is_fake_recipe(conf)
@@ -309,6 +402,7 @@ function model.scan(surface, force, target_ids, use_analyzer)
                 entities = {},
                 amounts = summed,
                 annotations = annotations,
+                rent = running_cost(amounts or {}),
             }
             rows_by_key[key] = row
             rows[#rows + 1] = row
@@ -415,7 +509,7 @@ end
 ---@param e { node: Rates.Node, has_positive: boolean? }
 ---@return "ignored" | "free" | "counted"
 local function default_mode(id, e, track_steam, fake_items)
-    if (is_ignored_node(e.node, track_steam) or (fake_items and fake_items[id])) then
+    if (is_ignored_node(e.node, track_steam)) then
         return "ignored"
     end
     if (not e.has_positive) then
@@ -476,25 +570,34 @@ end
 -- never hides what is needed further upstream; nothing that doesn't feed the targets adds any
 -- need. The solver works out which recipes make what: in loops, with byproducts and with
 -- several recipes for one item there is no single obvious answer, so it uses the buildings you
--- already have first, and only goes past them where it has to, as little as possible.
+-- already have first, and only goes past them where it has to, with as little hassle as possible.
 --
 --   variables: x_r = buildings running row r (targets: up to speed × count). Other rows have
 --              two columns with the same coefficients: up to the buildings you have (cheap),
 --              and any amount beyond that (expensive)
---   items:     net production >= 0 (counted items); unlimited and unmade items have no row
---   objective: run the targets at their speed first; then keep the extra buildings cheap,
---              each priced by what it takes to fit in (building_cost), however many of it
---              you have; then use as few of your own buildings as possible, each counted
---              relative to how many you have of it
+--   items:     net production >= 0 (counted items); unlimited and unmade items have no row.
+--              Items brought in from outside the model (nothing makes them, or dig sites make
+--              them by script) get a supply column, capped at what the factory made in the last
+--              hour (or what the plan uses, if more): model.cap_supplies, after a first solve
+--   objective: run the targets at their speed first; then keep the hassle of the extra
+--              buildings low: a clone of a group you have costs its width plus a quarter of
+--              its connections (its belts and pipes are there already), however many of it you
+--              have; then use as few of your own buildings as possible, each counted relative to
+--              how many you have of it
 --
 -- Per item: needed = what the chain uses at those rates; can make = what the buildings it uses
--- to make the item would make at 100% with the buildings you have. Coverage = can make ÷
--- needed: below 100% the item is short at the chosen speeds, and it runs out once the targets
--- are turned up past that fraction of them.
+-- to make the item would make at 100% with the buildings you have, plus its supply. Coverage =
+-- can make ÷ needed: below 100% the item is short at the chosen speeds, and it runs out once
+-- the targets are turned up past that fraction of them.
+--
+-- Projects (model.whatif_step): recipes you don't use for your targets yet, each built fresh in a
+-- building type you have. The solved plan's item prices pick the promising ones; those are added
+-- to the solved model as columns locked at 0, and each is unlocked alone on a copy of it, to see
+-- how much hassle it saves.
 
 local EPS = 1e-7
 local W_TARGET = 1e4
---- per unit of building_cost, for each building beyond the ones you have
+--- per unit of hassle, for each building beyond the ones you have
 local W_OVER = 1e-2
 --- per building you have, relative to how many you have
 local W_BUILDINGS = 1e-3
@@ -502,11 +605,14 @@ local W_BUILDINGS = 1e-3
 local RUN_TOL = 1e-6
 --- Items needed or made slower than this per second are solver noise.
 local NEED_TOL = 1e-4
+--- Upper bound of a supply column until it is capped.
+local SUPPLY_OPEN = 1e9
 
---- What one more building of a row takes to fit in: its width in tiles, a belt, pipe or
---- inserter for each item and fluid it uses or makes, a heat pipe if it runs on heat, and fuel
---- (plus its burnt result) if it burns something. Whatever you already have of it.
----@param row BCE.Row
+--- What a new building of a row takes to fit in (its hassle): its width in tiles, a belt, pipe
+--- or inserter for each item and fluid it uses or makes, a heat pipe if it runs on heat, and fuel
+--- (plus its burnt result) if it burns something. Default-temperature water it makes costs
+--- nothing: it can be voided or left. Whatever you already have of it.
+---@param row { conf: Rates.Configuration, amounts: { node: Rates.Node, amount: number }[] }
 ---@return number
 local function building_cost(row)
     local proto = row.conf and row.conf.entity
@@ -527,18 +633,48 @@ local function building_cost(row)
     end
     for _, a in ipairs(row.amounts) do
         local t = a.node.type
-        if (t == "item" or t == "fluid" or t == "any") then
+        if ((t == "item" or t == "fluid" or t == "any") and not (a.amount > 0 and is_water15(a.node))) then
             cost = cost + 1
         end
     end
     return cost
 end
 
+--- Hassle of one more building of a group you have: its width, plus a quarter of the rest of
+--- building_cost, since its belts and pipes are already there.
+---@param row BCE.Row
+---@return number
+function model.clone_hassle(row)
+    local full = building_cost(row)
+    local conf = row.conf
+    if (conf and conf.type == "meta" and conf.children and conf.children[1]) then
+        conf = conf.children[1]
+    end
+    local width = 3
+    local proto = conf and conf.entity
+    if (proto) then
+        pcall(function() width = proto.tile_width end)
+    end
+    return width + 0.25 * math.max(0, full - width)
+end
+
+---@class BCE.Prep
+---@field nodes table
+---@field modes table<string, string>
+---@field defaults table<string, string>
+---@field supply_ids table<string, true> brought in from outside the model: gets a supply column
+---@field kept integer[] scan rows feeding the targets
+---@field need_sorted string[] items with a balance row
+---@field node_con table<string, integer> item -> its balance row
+---@field track_steam boolean
+
+--- Which items are counted and which rows feed the targets: everything model.build needs before
+--- the solver's columns.
 ---@param scan BCE.Scan
 ---@param overrides table<string, string> node id -> "ignored" (treated as unlimited)
 ---@param track_steam boolean?
----@param speeds table<string, number> target row key -> speed (1 = 100%); missing = 100%
-function model.build(scan, overrides, track_steam, speeds)
+---@return BCE.Prep
+function model.prepare(scan, overrides, track_steam)
     local rows = scan.rows
     local nodes = collect_nodes(rows)
 
@@ -547,6 +683,19 @@ function model.build(scan, overrides, track_steam, speeds)
         local d = default_mode(id, e, track_steam, scan.fake_items)
         defaults[id] = d
         modes[id] = (d == "counted" and overrides[id] == "ignored") and "ignored" or d
+    end
+    -- brought in from outside the model (dig sites, script deliveries, hand-fed): counted, with
+    -- a supply column. Waste nothing makes is used up, not brought in.
+    local supply_ids = {} ---@type table<string, true>
+    for id, e in pairs(nodes) do
+        local t = e.node.type
+        local brought_in = (modes[id] == "free" and (t == "item" or t == "fluid")
+                and not (t == "item" and waste_items()[e.node.item.name]))
+            or (scan.fake_items and scan.fake_items[id] and modes[id] ~= "ignored")
+        if (brought_in and overrides[id] ~= "ignored") then
+            modes[id] = "counted"
+            supply_ids[id] = true
+        end
     end
     local function counted(id)
         return modes[id] == "counted"
@@ -559,6 +708,50 @@ function model.build(scan, overrides, track_steam, speeds)
             kept[#kept + 1] = ri
         end
     end
+
+    local need = {} ---@type table<string, true>
+    for _, ri in ipairs(kept) do
+        for _, a in ipairs(rows[ri].amounts) do
+            if (counted(a.id) and a.amount < 0) then
+                need[a.id] = true
+                for _, cid in ipairs(nodes[a.id].children or {}) do
+                    if (counted(cid)) then
+                        need[cid] = true
+                    end
+                end
+            end
+        end
+    end
+    local need_sorted = {} ---@type string[]
+    for id, _ in pairs(need) do
+        need_sorted[#need_sorted + 1] = id
+    end
+    table.sort(need_sorted)
+    local node_con = {} ---@type table<string, integer>
+    for i, id in ipairs(need_sorted) do
+        node_con[id] = i
+    end
+    return {
+        nodes = nodes,
+        modes = modes,
+        defaults = defaults,
+        supply_ids = supply_ids,
+        kept = kept,
+        need_sorted = need_sorted,
+        node_con = node_con,
+        track_steam = track_steam or false,
+    }
+end
+
+---@param scan BCE.Scan
+---@param overrides table<string, string> node id -> "ignored" (treated as unlimited)
+---@param track_steam boolean?
+---@param speeds table<string, number> target row key -> speed (1 = 100%); missing = 100%
+---@param prep BCE.Prep? from model.prepare with the same scan, overrides and track_steam
+function model.build(scan, overrides, track_steam, speeds, prep)
+    local rows = scan.rows
+    prep = prep or model.prepare(scan, overrides, track_steam)
+    local nodes, kept, need_sorted, node_con = prep.nodes, prep.kept, prep.need_sorted, prep.node_con
 
     local n, m = 0, 0
     local cols, upper, cost = {}, {}, {}
@@ -607,11 +800,11 @@ function model.build(scan, overrides, track_steam, speeds)
                 cost[v] = W_BUILDINGS / count
                 row_var[ri] = v
                 local o = var(nil)
-                cost[o] = W_OVER * building_cost(row)
+                cost[o] = W_OVER * model.clone_hassle(row)
                 twin_var[ri] = o
             else
                 local v = var(nil)
-                cost[v] = W_OVER * building_cost(row)
+                cost[v] = W_OVER * model.clone_hassle(row)
                 row_var[ri] = v
             end
         end
@@ -619,30 +812,10 @@ function model.build(scan, overrides, track_steam, speeds)
 
     -- item balances: net production >= 0. Every row gets a tiny distinct offset: many balances
     -- are exactly 0, and that many tied rows make the simplex stall.
-    local need = {} ---@type table<string, true>
-    for _, ri in ipairs(kept) do
-        for _, a in ipairs(rows[ri].amounts) do
-            if (counted(a.id) and a.amount < 0) then
-                need[a.id] = true
-                for _, cid in ipairs(nodes[a.id].children or {}) do
-                    if (counted(cid)) then
-                        need[cid] = true
-                    end
-                end
-            end
-        end
-    end
-    local need_sorted = {} ---@type string[]
-    for id, _ in pairs(need) do
-        need_sorted[#need_sorted + 1] = id
-    end
-    table.sort(need_sorted)
-    local node_con = {} ---@type table<string, integer>
-    for _, id in ipairs(need_sorted) do
+    for _ in ipairs(need_sorted) do
         m = m + 1
         b[m] = EPS * (1 + ((m * 7919) % 1000) / 1000)
         sign[m] = -1
-        node_con[id] = m
     end
     for _, ri in ipairs(kept) do
         local v, t = row_var[ri], twin_var[ri]
@@ -669,6 +842,18 @@ function model.build(scan, overrides, track_steam, speeds)
         end
     end
 
+    -- supplies of items brought in, free until capped
+    local supply_vars = {} ---@type table<string, integer>
+    for id, _ in pairs(prep.supply_ids) do
+        local i = node_con[id]
+        if (i) then
+            local v = var(SUPPLY_OPEN)
+            cost[v] = 0
+            set(i, v, 1)
+            supply_vars[id] = v
+        end
+    end
+
     local state = lp.create({
         n = n,
         m = m,
@@ -686,13 +871,72 @@ function model.build(scan, overrides, track_steam, speeds)
         twin_var = twin_var,
         node_con = node_con,
         transfers = transfers,
-        modes = modes,
-        defaults = defaults,
+        modes = prep.modes,
+        defaults = prep.defaults,
         nodes = nodes,
         n_targets = n_targets,
         n_constraints = m,
         track_steam = track_steam or false,
+        supply_vars = supply_vars,
     }
+end
+
+--- Production statistics of the last hour, per second: what came in from outside the model.
+---@param id string node id
+---@param force LuaForce
+---@param surface LuaSurface
+---@return number
+local function made_last_hour(id, force, surface)
+    local name = id:match("^item/([^(]+)")
+    local stats
+    if (name) then
+        stats = force.get_item_production_statistics(surface)
+    else
+        name = id:match("^fluid/([^/]+)")
+        stats = name and force.get_fluid_production_statistics(surface)
+    end
+    if (not stats) then
+        return 0
+    end
+    local ok, made = pcall(stats.get_flow_count, { name = name, category = "input",
+        precision_index = defines.flow_precision_index.one_hour, count = true })
+    return (ok and made or 0) / 3600
+end
+
+--- Caps the supplies of items brought in, on a solved model: at what the factory made in the
+--- last hour, or what the plan uses if that is more, so projects can't lean on free supply.
+--- The solve then continues (lp.step). False when that isn't possible (build it again).
+---@param built table
+---@param force LuaForce
+---@param surface LuaSurface
+---@return boolean
+function model.cap_supplies(built, force, surface)
+    local L = built.lp
+    built.caps = {}
+    for id, v in pairs(built.supply_vars) do
+        local cap = math.max(made_last_hour(id, force, surface), lp.value(L, v))
+        if (not lp.set_upper(L, v, cap)) then
+            return false
+        end
+        built.caps[id] = cap
+    end
+    built.capped = true
+    return true
+end
+
+--- Opens the supplies again, before a solve continues from this one (lp.step): what the plan
+--- uses changes with it. False when that isn't possible (build it again).
+---@param built table
+---@return boolean
+function model.uncap_supplies(built)
+    for _, v in pairs(built.supply_vars) do
+        if (not lp.set_upper(built.lp, v, SUPPLY_OPEN)) then
+            return false
+        end
+    end
+    built.caps = nil
+    built.capped = nil
+    return true
 end
 
 --- Change a target group's speed on a solved model, so lp.step continues from the last answer
@@ -736,6 +980,9 @@ end
 ---@field row_x table<integer, number> scan row index -> buildings the plan runs (rows feeding the targets)
 ---@field row_have table<integer, number> scan row index -> buildings you have of it
 ---@field main_of table<integer, string> scan row index -> its main product
+---@field row_extra table<integer, number> scan row index -> buildings the plan adds beyond the ones you have
+---@field price table<string, number> item -> hassle one more unit per second of it saves
+---@field projects BCE.Projects? filled in once the projects are tested (model.whatif_finish)
 
 --- Reads the solved model.
 ---@param built table
@@ -797,12 +1044,16 @@ function model.results(built, scan, speeds)
 
     local targets = {}
     local chain_units, chain_buildings = {}, 0
-    local row_x, row_have, main_of = {}, {}, {} ---@type table<integer, number>, table<integer, number>, table<integer, string>
+    local row_x, row_have, main_of, row_extra = {}, {}, {}, {} ---@type table<integer, number>, table<integer, number>, table<integer, string>, table<integer, number>
     for _, ri in ipairs(built.kept) do
         local row = rows[ri]
         local x = lp.value(st, built.row_var[ri])
         if (built.twin_var[ri]) then
-            x = x + lp.value(st, built.twin_var[ri])
+            local extra = lp.value(st, built.twin_var[ri])
+            x = x + extra
+            if (not row.is_target and extra > RUN_TOL) then
+                row_extra[ri] = extra
+            end
         end
         if (x < RUN_TOL) then
             x = 0
@@ -841,6 +1092,10 @@ function model.results(built, scan, speeds)
                 end
             end
         end
+    end
+    -- a supply (capped at what came in last hour) is what can be made of it
+    for id, cap in pairs(built.caps or {}) do
+        item(id).capacity = item(id).capacity + cap
     end
     -- what goes into an "any" node counts for the child that supplies it
     for _, tr in ipairs(built.transfers) do
@@ -886,7 +1141,457 @@ function model.results(built, scan, speeds)
         row_x = row_x,
         row_have = row_have,
         main_of = main_of,
+        row_extra = row_extra,
+        price = model.prices(built),
     }
+end
+
+-- ---------------------------------------------------------------------------
+-- Projects
+--
+-- A project: a recipe you don't use for your targets yet, built fresh (no modules) in a type of
+-- building you have. Once the plan is solved (and shown), every unlocked recipe in every building
+-- type that can make it is a candidate (spread over ticks). The plan prices every item in hassle;
+-- at those prices the most promising candidates are screened (model.screen), added to the solved
+-- model as locked columns (lp.extend), and each is tried alone on a copy of it: how much hassle it
+-- saves at your speeds, net of its own buildings, and how the running cost changes.
+
+--- Candidates tried as what-ifs. The top 10 by hassle saved were within the first 37 screened
+--- on a large Py base (2026-11-25): screening by price misses part of what a project changes.
+model.TEST_PROJECTS = 40
+--- Projects shown.
+model.SHOW_PROJECTS = 10
+--- At most this many screened candidates make the same main product.
+local PER_PRODUCT = 3
+--- Production calculations per unit of solver work, while looking for candidates: about as long
+--- as the solver takes (0.2 ms per calculation, 0.18 ms per 1000 work).
+local CALLS_PER_WORK = 1 / 1250
+
+---@class BCE.Candidate
+---@field n integer its index in the list of candidates
+---@field recipe LuaRecipePrototype
+---@field entity LuaEntityPrototype
+---@field quality LuaQualityPrototype
+---@field amounts { id: string, node: Rates.Node, amount: number }[] per building
+---@field fit number hassle of one new building (building_cost)
+---@field rent number running cost of one building per second
+
+local function can_craft(entity, recipe)
+    local cats = entity.crafting_categories or {}
+    local ok = false
+    for _, c in ipairs(recipe.categories or { recipe.category }) do
+        if (cats[c]) then
+            ok = true
+            break
+        end
+    end
+    if (not ok) then
+        return false
+    end
+    local nf, ni = 0, 0
+    for _, ing in ipairs(recipe.ingredients) do
+        if (ing.type == "fluid") then
+            nf = nf + 1
+        else
+            ni = ni + 1
+        end
+    end
+    for _, p in ipairs(recipe.products) do
+        if (p.type == "fluid") then
+            nf = nf + 1
+        end
+    end
+    if (nf > #entity.fluidbox_prototypes) then
+        return false
+    end
+    local max = entity.ingredient_count
+    return not (max and ni > max)
+end
+
+--- Whether the plan could feed it: every ingredient it needs is counted in the plan, or unlimited.
+---@param amounts { id: string, node: Rates.Node, amount: number }[]
+---@param built table
+local function plan_can_feed(amounts, built)
+    for _, am in ipairs(amounts) do
+        if (am.amount < 0 and not built.node_con[am.id]) then
+            if (built.modes[am.id] ~= "ignored" and not is_ignored_node(am.node, built.track_steam)) then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+--- Starts the search for candidates: what to try, nothing tried yet.
+---@param scan BCE.Scan
+---@param built table
+---@param force LuaForce
+---@param surface LuaSurface
+local function candidates_start(scan, built, force, surface)
+    local rows = scan.rows
+    local entities, seen = {}, {}
+    for _, row in ipairs(rows) do
+        local conf = row.conf
+        if (conf and conf.type == "meta" and conf.children and conf.children[1]) then
+            conf = conf.children[1]
+        end
+        local e = conf and conf.type == "crafting-machine" and conf.entity
+        if (e and (e.type == "assembling-machine" or e.type == "furnace") and not e.fixed_recipe and not seen[e.name]) then
+            seen[e.name] = true
+            entities[#entities + 1] = { entity = e, quality = conf.quality }
+        end
+    end
+    table.sort(entities, function(a, b) return a.entity.name < b.entity.name end)
+    local used = {}
+    for _, ri in ipairs(built.kept) do
+        local conf = rows[ri].conf
+        if (conf and conf.type == "meta" and conf.children) then
+            for _, ch in ipairs(conf.children) do
+                if (ch.recipe) then
+                    used[ch.recipe.name] = true
+                end
+            end
+        elseif (conf and conf.recipe) then
+            used[conf.recipe.name] = true
+        end
+    end
+    local recipes = {}
+    for name, r in pairs(force.recipes) do
+        local proto = prototypes.recipe[name]
+        if (r.enabled and proto and not proto.hidden and not used[name]) then
+            recipes[#recipes + 1] = proto
+        end
+    end
+    table.sort(recipes, function(a, b) return a.name < b.name end)
+    return { force = force, surface = surface, entities = entities, recipes = recipes, ri = 1, ei = 1, list = {} }
+end
+
+--- Tries recipe × building pairs until about `budget` production calculations are done.
+---@return boolean finished
+local function candidates_step(cjob, built, budget)
+    local entities, recipes = cjob.entities, cjob.recipes
+    local left = budget
+    while (cjob.ri <= #recipes) do
+        if (left <= 0) then
+            return false
+        end
+        local proto = recipes[cjob.ri]
+        local e = entities[cjob.ei]
+        if (e and can_craft(e.entity, proto)) then
+            left = left - 1
+            local cconf = { type = "crafting-machine", entity = e.entity, quality = e.quality,
+                module_effects = {}, recipe = proto, recipe_quality = e.quality }
+            local ok, raw = pcall(api.configuration.get_production, cconf,
+                { force = cjob.force, surface = cjob.surface, use_pollution = false })
+            if (ok and raw) then
+                local summed = sum_amounts(raw)
+                if (plan_can_feed(summed, built)) then
+                    cjob.list[#cjob.list + 1] = { n = #cjob.list + 1, recipe = proto, entity = e.entity, quality = e.quality, amounts = summed,
+                        fit = building_cost({ conf = cconf, amounts = summed }), rent = running_cost(raw) }
+                end
+            end
+        else
+            left = left - 0.02
+        end
+        cjob.ei = cjob.ei + 1
+        if (cjob.ei > #entities) then
+            cjob.ei = 1
+            cjob.ri = cjob.ri + 1
+        end
+    end
+    return true
+end
+
+--- What one more unit per second of each item saves in the solved plan, in hassle.
+---@param built table
+---@return table<string, number>
+function model.prices(built)
+    local L = built.lp
+    local price = {}
+    for id, i in pairs(built.node_con) do
+        local j = L.n + i
+        price[id] = L.pos[j] and 0 or (L.d[1][j] / W_OVER)
+    end
+    return price
+end
+
+--- The candidates worth trying, most promising first: what they make minus what they use at the
+--- plan's prices, minus their own hassle. The best building type per recipe, and only a few per
+--- main product, so one cheap item doesn't take every place.
+---@param built table solved
+---@param cands BCE.Candidate[]
+---@return BCE.Candidate[]
+function model.screen(built, cands)
+    local price = model.prices(built)
+    local list = {}
+    for ci, c in ipairs(cands) do
+        local v, main, best = 0, nil, -1
+        for _, am in ipairs(c.amounts) do
+            local p = price[am.id]
+            if (p) then
+                v = v + am.amount * p
+                if (am.amount > 0 and am.amount * p > best) then
+                    main, best = am.id, am.amount * p
+                end
+            end
+        end
+        local score = v - c.fit
+        if (score > 1e-6) then
+            list[#list + 1] = { ci = ci, score = score, main = main or "?" }
+        end
+    end
+    table.sort(list, function(a, b)
+        if (a.score ~= b.score) then return a.score > b.score end
+        return a.ci < b.ci
+    end)
+    local pool, per, seen = {}, {}, {}
+    for _, e in ipairs(list) do
+        if (#pool >= model.TEST_PROJECTS) then
+            break
+        end
+        local c = cands[e.ci]
+        if (not seen[c.recipe.name] and (per[e.main] or 0) < PER_PRODUCT) then
+            seen[c.recipe.name] = true
+            per[e.main] = (per[e.main] or 0) + 1
+            pool[#pool + 1] = c
+        end
+    end
+    return pool
+end
+
+--- The objective of a solved state, in hassle.
+local function objective(L)
+    local c, total = L.c[1], 0
+    for j = 1, L.n do
+        local v = lp.value(L, j)
+        if (v ~= 0 and c[j] ~= 0) then
+            total = total + c[j] * v
+        end
+    end
+    return total / W_OVER
+end
+
+--- Starts looking for projects on the solved (and capped) model: candidates first, unless the
+--- model has them from an earlier run (they don't depend on the speeds).
+---@param built table
+---@param scan BCE.Scan
+---@param force LuaForce
+---@param surface LuaSurface
+function model.whatif_start(built, scan, force, surface)
+    local job = { phase = "cands", k = 1, tests = {}, results = {} }
+    if (not built.cand_list) then
+        job.cjob = candidates_start(scan, built, force, surface)
+    end
+    return job
+end
+
+--- 0..1 through the search for candidates, or nil once it is done.
+function model.candidates_progress(job)
+    if (job.phase ~= "cands" or not job.cjob) then
+        return nil
+    end
+    return (job.cjob.ri - 1) / math.max(1, #job.cjob.recipes)
+end
+
+--- The screened candidates as columns of the solved model (each once), and its state to compare with.
+local function whatif_prepare(job, built, scan)
+    local rows, L = scan.rows, built.lp
+    local pool = model.screen(built, built.cand_list)
+    built.cand_var = built.cand_var or {}
+    local cols, costs, added = {}, {}, {}
+    for _, c in ipairs(pool) do
+        if (not built.cand_var[c.n]) then
+            local col = {}
+            for _, am in ipairs(c.amounts) do
+                local i = built.node_con[am.id]
+                if (i) then
+                    -- balance rows are "made − used ≥ 0", stored negated (model.build)
+                    col[i] = (col[i] or 0) - am.amount
+                end
+            end
+            cols[#cols + 1] = col
+            costs[#costs + 1] = W_OVER * c.fit
+            added[#added + 1] = c
+        end
+    end
+    for t, j in ipairs(lp.extend(L, cols, costs)) do
+        built.cand_var[added[t].n] = j
+    end
+    for _, c in ipairs(pool) do
+        job.tests[#job.tests + 1] = { cand = c, var = built.cand_var[c.n] }
+    end
+    local base_twin, base_run = {}, {}
+    for _, ri in ipairs(built.kept) do
+        if (not rows[ri].is_target) then
+            local tv = built.twin_var[ri]
+            local t = tv and lp.value(L, tv) or 0
+            base_twin[ri] = t
+            base_run[ri] = lp.value(L, built.row_var[ri]) + t
+        end
+    end
+    job.base_twin, job.base_run, job.obj0 = base_twin, base_run, objective(L)
+    job.phase = "test"
+end
+
+--- Reads a finished what-if.
+local function whatif_read(job, built, scan, fork, test)
+    local rows = scan.rows
+    local diff, drent = {}, 0
+    for ri, t0 in pairs(job.base_twin) do
+        local tv = built.twin_var[ri]
+        local t = tv and lp.value(fork, tv) or 0
+        local run = lp.value(fork, built.row_var[ri]) + t
+        drent = drent + (run - job.base_run[ri]) * rows[ri].rent
+        if (math.abs(t - t0) > 1e-6) then
+            diff[ri] = t - t0
+        end
+    end
+    local x = lp.value(fork, test.var)
+    drent = drent + x * test.cand.rent
+    job.results[#job.results + 1] = { cand = test.cand, saved = job.obj0 - objective(fork), x = x, drent = drent, diff = diff }
+end
+
+--- Looks for projects and tries them, until about `budget` units of solver work are done.
+---@return boolean finished
+function model.whatif_step(job, built, scan, budget)
+    if (job.phase == "cands") then
+        if (job.cjob) then
+            if (not candidates_step(job.cjob, built, math.max(1, budget * CALLS_PER_WORK))) then
+                return false
+            end
+            built.cand_list = job.cjob.list
+            job.cjob = nil
+        end
+        -- the columns and a pass over the plan: about as long as a tick of the solver
+        whatif_prepare(job, built, scan)
+        return false
+    end
+    local spent = 0
+    while (spent < budget) do
+        if (not job.fork) then
+            local test = job.tests[job.k]
+            if (not test) then
+                job.phase = "done"
+                return true
+            end
+            local fork = lp.fork(built.lp)
+            spent = spent + fork.N
+            if (lp.set_upper(fork, test.var, 1e6)) then
+                job.fork = fork
+            else
+                job.k = job.k + 1
+            end
+        else
+            local fork = job.fork
+            local w0 = fork.work
+            local finished = lp.step(fork, budget - spent, true)
+            spent = spent + (fork.work - w0)
+            if (finished) then
+                if (fork.status == "optimal") then
+                    whatif_read(job, built, scan, fork, job.tests[job.k])
+                end
+                job.fork = nil
+                job.k = job.k + 1
+            end
+        end
+    end
+    return false
+end
+
+---@class BCE.Project
+---@field recipe LuaRecipePrototype
+---@field entity LuaEntityPrototype
+---@field x number buildings to build
+---@field saved number hassle saved at your speeds, net of its own buildings
+---@field drent number change in running cost per second (negative: saved)
+---@field diff table<integer, number> scan row index -> change in the buildings the plan adds there
+---@field downs { ri: integer, d: number }[] rows that need fewer new buildings, most first
+---@field ups { ri: integer, d: number }[] rows that need more new buildings, most first
+
+---@class BCE.Projects
+---@field tested integer
+---@field extra_buildings number new buildings the plan adds in groups you have
+---@field extra_hassle number their hassle
+---@field list BCE.Project[] best first, at most model.SHOW_PROJECTS
+
+--- The tried projects, best first.
+---@param job table finished
+---@param built table
+---@param scan BCE.Scan
+---@param result BCE.Result
+---@return BCE.Projects
+function model.whatif_finish(job, built, scan, result)
+    table.sort(job.results, function(a, b) return a.saved > b.saved end)
+    local list = {}
+    for _, r in ipairs(job.results) do
+        if (#list >= model.SHOW_PROJECTS or r.saved <= 1e-6) then
+            break
+        end
+        local downs, ups = {}, {}
+        for ri, d in pairs(r.diff) do
+            if (d < -0.1) then
+                downs[#downs + 1] = { ri = ri, d = d }
+            elseif (d > 0.1) then
+                ups[#ups + 1] = { ri = ri, d = d }
+            end
+        end
+        table.sort(downs, function(a, b) return a.d < b.d end)
+        table.sort(ups, function(a, b) return a.d > b.d end)
+        local c = r.cand
+        list[#list + 1] = { recipe = c.recipe, entity = c.entity, quality = c.quality, x = r.x, saved = r.saved, drent = r.drent,
+            diff = r.diff, downs = downs, ups = ups }
+    end
+    local n, h = 0, 0
+    for ri, x in pairs(result.row_extra) do
+        if (x > 1e-3) then
+            n = n + x
+            h = h + x * model.clone_hassle(scan.rows[ri])
+        end
+    end
+    return { tested = #job.results, extra_buildings = n, extra_hassle = h, list = list }
+end
+
+--- Regret: a shown project that would make at least 1 and 20% of these new buildings
+--- unnecessary. The one that cuts them the most.
+---@param projects BCE.Projects
+---@param ris integer[] scan rows
+---@param row_extra table<integer, number>
+---@return BCE.Project? project
+---@return number? left what is left of them with it
+---@return integer? rank
+function model.regret(projects, ris, row_extra)
+    local xb = 0
+    for _, ri in ipairs(ris) do
+        xb = xb + (row_extra[ri] or 0)
+    end
+    if (xb < 1) then
+        return nil
+    end
+    local best, left, rank = nil, xb, nil
+    for k, p in ipairs(projects.list) do
+        local x2 = 0
+        for _, ri in ipairs(ris) do
+            x2 = x2 + (row_extra[ri] or 0) + (p.diff[ri] or 0)
+        end
+        if (x2 < left - 1e-6 and xb - x2 >= math.max(1, 0.2 * xb)) then
+            best, left, rank = p, x2, k
+        end
+    end
+    return best, left, rank
+end
+
+--- The rows whose new buildings are for an item: the plan's extra buildings making it.
+---@param result BCE.Result
+---@param id string
+---@return integer[]
+function model.extra_rows_of(result, id)
+    local list = {}
+    for ri, x in pairs(result.row_extra) do
+        if (x > 1e-3 and result.main_of[ri] == id) then
+            list[#list + 1] = ri
+        end
+    end
+    return list
 end
 
 return model

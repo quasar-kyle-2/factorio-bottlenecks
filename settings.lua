@@ -16,13 +16,6 @@ data:extend({
         order = "b",
     },
     {
-        type = "bool-setting",
-        name = "bottleneck-calc-extreme-track-steam",
-        setting_type = "runtime-per-user",
-        default_value = false,
-        order = "b2",
-    },
-    {
         type = "int-setting",
         name = "bottleneck-calc-extreme-max-rows",
         setting_type = "runtime-per-user",

@@ -1,7 +1,24 @@
 ---------------------------------------------------------------------------------------------------
 Version: 1.1.2
-Date: 2026-11-25
+Date: 2026-11-26
+  Features:
+    - Project recommendations: a new pane lists the 10 recipes you don't use yet that would save
+      the most effort ("hassle") at the speeds you chose, each built fresh in a building type you
+      have: how many to build, how much hassle and running cost ("rent") they save (as bars, the
+      numbers in the tooltips), and which new buildings they make unnecessary or need. They are
+      worked out after the results show
+    - Items: a short item better handled by one of those projects gets a red "!", its tooltip
+      naming the project
+    - Item report: a "new" column in Goes to and Made by shows the new buildings the plan adds to
+      each group, and the summary shows how many it adds for the item
   Changes:
+    - Extra buildings are planned by hassle: one more building of a group you have costs less than
+      a new one, since its belts and pipes are already there
+    - Steam, water at other than its default temperature and waste that recipes make are counted
+      like any other item. The "Track steam" setting is gone
+    - Fuels made for one kind of building (drill heads, fuel rods) are counted as ingredients
+    - Items that come from outside the factory (nexelit ore from dig sites, deliveries, what you
+      hand-feed) are counted, capped at what came in during the last hour
     - Item report: in Made by, building groups left below 100% while another group making the
       item runs past 100% get an info icon by "needed", explaining why they sit idle
 ---------------------------------------------------------------------------------------------------

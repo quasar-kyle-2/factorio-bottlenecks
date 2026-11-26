@@ -30,7 +30,9 @@ local function progress_caption(built)
     return { "gui.bottleneck-calc-extreme-solving", tostring(math.floor(pct)) }
 end
 
---- Build the model from the last scan and start solving it over the next ticks.
+--- Build the model from the last scan and start solving it over the next ticks. Once solved,
+--- its supplies are capped (model.cap_supplies) and it is solved again from there; then the
+--- results show, and projects are looked for and tried (s.proj_job).
 ---@param player LuaPlayer
 local function start_solve(player)
     local s = gui.get_storage(player)
@@ -38,7 +40,8 @@ local function start_solve(player)
         return
     end
     s.stopped = nil
-    local built = model.build(s.scan, s.overrides, setting(player, "track-steam") --[[@as boolean]], s.speeds)
+    s.proj_job = nil
+    local built = model.build(s.scan, s.overrides, true, s.speeds)
     s.built = built
     s.solved = nil
     s.result = nil
@@ -142,7 +145,9 @@ end
 gui.callbacks.set_speeds = function(player, changes)
     local s = gui.get_storage(player)
     local built = (not s.built) and s.solved or nil
-    local warm = built ~= nil and s.scan ~= nil
+    -- the projects were tried on the answer that is about to change
+    s.proj_job = nil
+    local warm = built ~= nil and s.scan ~= nil and model.uncap_supplies(built)
     for row_key, speed in pairs(changes) do
         s.speeds[row_key] = (math.abs(speed - 1) > 1e-9) and speed or nil
         -- once one can't continue, the rest needn't try: start_solve builds from scratch
@@ -208,6 +213,12 @@ end
 gui.callbacks.stop = function(player)
     local s = gui.get_storage(player)
     if (not s.built) then
+        -- trying projects: stop that, the results stay
+        if (s.proj_job and s.result) then
+            s.proj_job = nil
+            s.result.projects = { stopped = true }
+            gui.render(player, s.result)
+        end
         return
     end
     -- pending speeds stay: the targets still show, with their Apply button
@@ -342,16 +353,41 @@ script.on_event(defines.events.on_tick, function(e)
         local built = s.built
         if (built) then
             local player = game.get_player(player_index)
-            if (not player or not player.valid or not s.scan) then
+            local surface = s.scan and game.get_surface(s.scan.surface_index)
+            if (not player or not player.valid or not s.scan or not surface) then
                 s.built = nil
-            elseif (lp.step(built.lp, setting(player, "work-per-tick") --[[@as integer]])) then
+            elseif (not lp.step(built.lp, setting(player, "work-per-tick") --[[@as integer]])) then
+                if (e.tick % 2 == 0) then
+                    gui.update_progress(player, progress_caption(built))
+                end
+            elseif (not built.capped and built.lp.status == "optimal"
+                    and model.cap_supplies(built, player.force --[[@as LuaForce]], surface)) then
+                -- solved: now with the supplies capped, solved again from there
+            else
                 s.built = nil
                 s.solved = built
                 built.warm = nil
                 s.result = model.results(built, s.scan, s.speeds)
+                -- the projects next, a little each tick, on copies of this answer
+                if (built.lp.status == "optimal") then
+                    local job = model.whatif_start(built, s.scan, player.force --[[@as LuaForce]], surface)
+                    job.result, job.built = s.result, built
+                    s.proj_job = job
+                end
                 gui.render(player, s.result)
-            elseif (e.tick % 2 == 0) then
-                gui.update_progress(player, progress_caption(built))
+            end
+        end
+        local pj = s.proj_job
+        if (pj and not s.built) then
+            local player = game.get_player(player_index)
+            if (not player or not player.valid or pj.result ~= s.result or pj.built ~= s.solved or not s.scan) then
+                s.proj_job = nil
+            elseif (model.whatif_step(pj, s.solved, s.scan, setting(player, "work-per-tick") --[[@as integer]])) then
+                s.proj_job = nil
+                s.result.projects = model.whatif_finish(pj, s.solved, s.scan, s.result)
+                gui.render(player, s.result)
+            elseif (e.tick % 10 == 0 or pj.phase == "test" and pj.k == 1) then
+                gui.update_projects(player)
             end
         end
         -- the report's Productivity section, a little each tick
@@ -440,7 +476,7 @@ remote.add_interface("bottleneck-calc-extreme", {
     ---@param target_unit_numbers integer[]
     ---@param overrides table<string, string>? node id -> "ignored"
     ---@param use_analyzer boolean?
-    ---@param track_steam boolean?
+    ---@param track_steam boolean? false: steam is unlimited (the window always counts it)
     ---@param speeds table<string, number>? part of a target row key -> speed
     analyze = function(surface_index, force_name, target_unit_numbers, overrides, use_analyzer, track_steam, speeds)
         local surface = game.get_surface(surface_index)
@@ -461,11 +497,15 @@ remote.add_interface("bottleneck-calc-extreme", {
                 end
             end
         end
-        local built = model.build(scan, overrides or {}, track_steam, by_key)
+        local built = model.build(scan, overrides or {}, track_steam ~= false, by_key)
         if (built.n_targets == 0) then
             return nil
         end
         while (not lp.step(built.lp, 1e12)) do
+        end
+        if (built.lp.status == "optimal" and model.cap_supplies(built, force, surface)) then
+            while (not lp.step(built.lp, 1e12)) do
+            end
         end
         local result = model.results(built, scan, by_key)
         local items = {}
@@ -498,7 +538,7 @@ script.on_configuration_changed(function()
         end
         -- scans hold prototypes and node ids that may be stale after mod changes
         for _, s in pairs(storage.players) do
-            s.scan, s.built, s.solved, s.result, s.gui, s.prod_job = nil, nil, nil, nil, nil, nil
+            s.scan, s.built, s.solved, s.result, s.gui, s.prod_job, s.proj_job = nil, nil, nil, nil, nil, nil, nil
             -- without a scan a stopped window would show no targets: scan again on open
             s.stopped = nil
             -- left over from 0.1.x

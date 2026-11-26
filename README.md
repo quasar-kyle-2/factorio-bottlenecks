@@ -22,8 +22,11 @@ takes an evening.
    it right now), every building that makes it (and which of its own inputs are short), and what
    the item mostly turns into on the way to your targets. Click a building icon there to find
    those buildings on the map.
-6. **Right-click** an item to treat it as unlimited (and again to count it).
-7. Pin the window for a compact view that stays open while you build. Press **Refresh** after
+6. Check **Project recommendations**: recipes you don't use yet that would save the most
+   effort, each built fresh. A short item with a red **!** is better handled by one of them
+   than by more of the buildings you have.
+7. **Right-click** an item to treat it as unlimited (and again to count it).
+8. Pin the window for a compact view that stays open while you build. Press **Refresh** after
    you build to see the new picture.
 
 ## How it works
@@ -34,12 +37,21 @@ progress bar and a stop button. Speed changes continue from the last answer, so 
 under a second even on a large base.
 
 - It uses the buildings you already have first, and only plans past them where it has to,
-  pricing each extra building by how hard it is to fit in.
+  pricing each extra building by how hard it is to fit in (its "hassle"). One more building of a
+  group you have is cheaper than a new one, since its belts are already there.
 - Each item is counted as if everything it needs were there, so a shortage upstream never hides
   what's needed further down.
 - Planned changes count as done: ghosts, pending upgrades and module requests are included.
-- Power, fuel, heat and water are treated as unlimited. Steam is too, unless you turn on
-  *Track steam* in the mod settings. Fuel waste such as ash and spent fuel cells is unlimited.
+- Power, fuel, heat and water at its default temperature are treated as unlimited, and so is
+  what burning fuel leaves behind (ash, spent fuel cells). Steam, hot water and waste a recipe
+  makes are counted like any other item. Fuels made for one kind of building (drill heads, fuel
+  rods) are counted too.
+- Items that come from outside (deliveries, hand-feeding, nexelit ore from dig sites) are capped
+  at what came in during the last hour.
+- After the results show, it looks for projects: every recipe you have unlocked but don't use,
+  in every building type you have. The 40 most promising at the plan's prices are each tried on
+  a copy of the solved plan, and the 10 that save the most hassle are listed, with how much
+  running cost they save.
 
 ## Settings (per player)
 
@@ -47,7 +59,6 @@ under a second even on a large base.
   longer wait.
 - **Analyze belts and pipes**: traces belts, inserters and pipes to find furnace recipes and fluid
   temperatures. More accurate, slower to scan.
-- **Track steam**: count steam as an item that can run short.
 - **Maximum rows per section**: longer lists are cut off to keep the window responsive.
 
 ## Requirements
