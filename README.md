@@ -27,7 +27,8 @@ takes an evening.
    than by more of the buildings you have.
 7. **Right-click** an item to treat it as unlimited (and again to count it).
 8. Pin the window for a compact view that stays open while you build. Press **Refresh** after
-   you build to see the new picture.
+   you build to see the new picture. After a few changes it carries on from the last answer, so
+   it's back in seconds.
 
 ## How it works
 
@@ -35,6 +36,16 @@ The mod builds a linear program from every crafting building on the surface (rec
 beacons, productivity) and solves it with a revised simplex over a few ticks, with a
 progress bar and a stop button. Speed changes continue from the last answer, so they take
 under a second even on a large base.
+
+Refresh does the same when the factory changed only a little since the last answer: buildings
+added or removed, other modules or recipes, ghosts. It matches the new scan's building groups to
+the last plan, changes what changed, and lets the solver carry on from there (a dual simplex
+brings the plan back within the new limits). The answer is the same as working it out from
+scratch. It starts from scratch anyway after research or a change to the recipes you have
+unlocked (Pyanodon's TURD choices included), mod settings or mods, unlimited items or targets,
+when the factory needs an item it didn't before (or stops needing one), when a few hundred
+building groups changed at once, or when carrying on takes more than a quarter of the work of
+the last full analysis.
 
 - It uses the buildings you already have first, and only plans past them where it has to,
   pricing each extra building by how hard it is to fit in (its build cost): its width, a belt,

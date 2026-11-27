@@ -321,6 +321,41 @@ local function is_fake_recipe(conf)
     return ok and fake == true
 end
 
+--- What the force has researched and unlocked, as one string: research, recipes enabled and
+--- their productivity, and the force-wide bonuses that change what buildings make. A warm
+--- Refresh (model.warm_build) needs it unchanged. Pyanodon's TURD choices change it too: they
+--- research hidden technologies and enable or disable recipes.
+---@param force LuaForce
+---@return string
+function model.tech_signature(force)
+    local researched, levels = 0, 0
+    for _, tech in pairs(force.technologies) do
+        if (tech.researched) then
+            researched = researched + 1
+        end
+        levels = levels + (tech.level or 0)
+    end
+    local enabled, prod, h = 0, 0, 0
+    for name, recipe in pairs(force.recipes) do
+        if (recipe.enabled) then
+            enabled = enabled + 1
+            -- order-free hash of which recipes are enabled
+            local x = 0
+            for i = 1, #name, 3 do
+                x = (x * 31 + string.byte(name, i)) % 1000003
+            end
+            h = (h + x) % 1000000007
+        end
+        prod = prod + (recipe.productivity_bonus or 0)
+    end
+    local bonus = 0
+    pcall(function()
+        bonus = force.mining_drill_productivity_bonus + 7 * force.laboratory_speed_modifier
+            + 13 * force.laboratory_productivity_bonus
+    end)
+    return string.format("%d/%d/%d/%d/%.12g/%.12g", researched, levels, enabled, h, prod, bonus)
+end
+
 ---@param surface LuaSurface
 ---@param force LuaForce
 ---@param target_ids table<integer, true>
@@ -454,6 +489,8 @@ function model.scan(surface, force, target_ids, use_analyzer)
         planned_changes = planned,
         fake_items = fake_items,
         lane_rate = model.lane_rate(force),
+        use_analyzer = use_analyzer and true or false,
+        tech_sig = model.tech_signature(force),
     }
 end
 
@@ -727,6 +764,64 @@ function model.clone_hassle(row, lane)
     return width + 0.25 * links + lanes + power
 end
 
+--- A row's columns in the model: "target" (its buildings up to speed × count, rewarded, plus
+--- an unrewarded twin), "have" (up to the buildings you have, at their rent, plus a twin for any
+--- beyond them at their hassle) or "new" (none yet: one column at hassle).
+---@param row BCE.Row
+---@param have number buildings you have of it (meta groups shared out)
+---@param speeds table<string, number>
+---@param lane number?
+---@return string kind
+---@return number? upper of the first column (nil: none)
+---@return number cost of the first column
+---@return number? cost of the twin (nil: no twin)
+local function row_spec(row, have, speeds, lane)
+    if (row.is_target) then
+        local count = math.max(1, total_count(row))
+        return "target", (speeds[row.key] or 1) * row.count_max, -W_TARGET / count, 0
+    end
+    local rent = W_RENT * math.max(row.rent or 0, MIN_RENT)
+    local over = W_OVER * model.clone_hassle(row, lane) + rent
+    if (have > 0) then
+        return "have", have, rent, over
+    end
+    return "new", nil, over, nil
+end
+
+---@param t table
+---@return table
+local function copy_flat(t)
+    local r = {}
+    for k, v in pairs(t) do
+        r[k] = v
+    end
+    return r
+end
+
+--- Buildings you have of each kept row: a machine that switches between recipes counts evenly
+--- toward each of them.
+---@param rows BCE.Row[]
+---@param kept integer[]
+---@return table<integer, number>
+local function have_counts(rows, kept)
+    local meta_children = {} ---@type table<string, integer>
+    for _, ri in ipairs(kept) do
+        for meta_id, _ in pairs(rows[ri].count_groups or {}) do
+            meta_children[meta_id] = (meta_children[meta_id] or 0) + 1
+        end
+    end
+    local have = {}
+    for _, ri in ipairs(kept) do
+        local row = rows[ri]
+        local h = row.count_max
+        for meta_id, k in pairs(row.count_groups or {}) do
+            h = h + k / meta_children[meta_id]
+        end
+        have[ri] = h
+    end
+    return have
+end
+
 ---@class BCE.Prep
 ---@field nodes table
 ---@field modes table<string, string>
@@ -837,48 +932,31 @@ function model.build(scan, overrides, track_steam, speeds, prep)
         cols[j][i] = (v ~= 0) and v or nil
     end
 
-    -- buildings of a machine that switches between recipes count evenly toward each of them
-    local meta_children = {} ---@type table<string, integer>
-    for _, ri in ipairs(kept) do
-        for meta_id, _ in pairs(rows[ri].count_groups or {}) do
-            meta_children[meta_id] = (meta_children[meta_id] or 0) + 1
-        end
-    end
+    local have_of = have_counts(rows, kept)
 
     local row_var = {} ---@type table<integer, integer>
     -- Each target group also has an unrewarded twin column: lowering its speed hands the excess
     -- to the twin without changing anything else, so the solver can continue from there.
     -- For other rows the twin is the expensive column: buildings beyond the ones you have.
     local twin_var = {} ---@type table<integer, integer>
+    -- row key -> its columns, for a warm Refresh (model.warm_build)
+    local col_of = {} ---@type table<string, { v: integer, t: integer? }>
     local n_targets = 0
     for _, ri in ipairs(kept) do
         local row = rows[ri]
-        local count = math.max(1, total_count(row))
-        if (row.is_target) then
+        local kind, ub, cv, ct = row_spec(row, have_of[ri], speeds, lane)
+        if (kind == "target") then
             n_targets = n_targets + 1
-            local v = var((speeds[row.key] or 1) * row.count_max)
-            cost[v] = -W_TARGET / count
-            row_var[ri] = v
-            twin_var[ri] = var(nil)
-        else
-            local have = row.count_max
-            for meta_id, k in pairs(row.count_groups or {}) do
-                have = have + k / meta_children[meta_id]
-            end
-            local rent = W_RENT * math.max(row.rent or 0, MIN_RENT)
-            if (have > 0) then
-                local v = var(have)
-                cost[v] = rent
-                row_var[ri] = v
-                local o = var(nil)
-                cost[o] = W_OVER * model.clone_hassle(row, lane) + rent
-                twin_var[ri] = o
-            else
-                local v = var(nil)
-                cost[v] = W_OVER * model.clone_hassle(row, lane) + rent
-                row_var[ri] = v
-            end
         end
+        local v = var(ub)
+        cost[v] = cv
+        row_var[ri] = v
+        if (ct) then
+            local t = var(nil)
+            cost[t] = (ct ~= 0) and ct or nil
+            twin_var[ri] = t
+        end
+        col_of[row.key] = { v = v, t = twin_var[ri] }
     end
 
     -- item balances: net production >= 0. Every row gets a tiny distinct offset: many balances
@@ -949,7 +1027,381 @@ function model.build(scan, overrides, track_steam, speeds, prep)
         n_constraints = m,
         track_steam = track_steam or false,
         supply_vars = supply_vars,
+        -- what a warm Refresh must match
+        col_of = col_of,
+        need_sorted = need_sorted,
+        overrides = copy_flat(overrides),
+        surface_index = scan.surface_index,
+        lane = lane,
+        use_analyzer = scan.use_analyzer,
+        tech_sig = scan.tech_sig,
+        target_sig = model.target_signature(scan, kept),
+        warm_chain = 0,
+        cold = true,
     }
+end
+
+--- The target groups and their counts, as one string.
+---@param scan BCE.Scan
+---@param kept integer[]
+---@return string
+function model.target_signature(scan, kept)
+    local list = {}
+    for _, ri in ipairs(kept) do
+        local row = scan.rows[ri]
+        if (row.is_target) then
+            list[#list + 1] = row.key .. "#" .. row.count_max
+        end
+    end
+    table.sort(list)
+    return table.concat(list, "|")
+end
+
+-- ---------------------------------------------------------------------------
+-- Warm Refresh
+--
+-- A Refresh after a few changes to the factory (buildings built, removed, given other modules or
+-- recipes) continues from the last answer: the model stays, its columns are matched to the new
+-- scan's building groups by key, bounds change for groups whose count changed, groups that are
+-- gone are locked at 0 and new ones are added (lp.extend), and the solver brings the solution
+-- back within the new bounds (dual simplex) and optimizes again. The answer is the same as from
+-- scratch (the same optimum; between plans that tie exactly, it may pick another one).
+--
+-- It starts from scratch instead when anything else changed (model.warm_build says why): the
+-- item balances, unlimited items, supplies, targets, research or unlocked recipes (Pyanodon's
+-- TURD choices included), force bonuses, belts, the surface, the analyzer setting, what a kept
+-- group makes or costs, or too much at once. It also gives up for a cold start when the warm
+-- solve takes more than a quarter of the last cold solve's work (control.lua).
+
+--- Groups that may change at once before a cold start is used: a few times what one gameplay
+--- session between Refreshes changes. Measured on a large Py base (2026-11-27): 300 changed
+--- groups warm in about 1 s against about 90 s cold.
+local WARM_MAX_CHANGED = 300
+local WARM_MAX_CHANGED_SHARE = 0.25
+--- Columns left locked (gone groups, tried projects) before the model is rebuilt cold.
+local WARM_MAX_DEAD_SHARE = 0.25
+--- Warm Refreshes in a row before one cold one, so nothing builds up.
+local WARM_MAX_CHAIN = 25
+--- Share of the last cold solve's work a warm Refresh may take (control.lua)
+model.WARM_WORK_SHARE = 0.25
+
+---@param a number
+---@param b number
+local function close(a, b)
+    if (a == b) then
+        return true
+    end
+    local m = math.max(math.abs(a), math.abs(b))
+    return math.abs(a - b) <= 1e-12 * m
+end
+
+--- The column a row gets: its amounts on the item balances (sign as in model.build).
+---@param row BCE.Row
+---@param node_con table<string, integer>
+---@return table<integer, number>
+local function row_column(row, node_con)
+    local c = {}
+    for _, a in ipairs(row.amounts) do
+        local i = node_con[a.id]
+        if (i) then
+            local v = (c[i] or 0) - a.amount
+            c[i] = (v ~= 0) and v or nil
+        end
+    end
+    return c
+end
+
+---@param A table<integer, number>
+---@param c table<integer, number>
+local function same_column(A, c)
+    for i, a in pairs(A) do
+        if (not c[i] or not close(a, c[i])) then
+            return false
+        end
+    end
+    for i, _ in pairs(c) do
+        if (not A[i]) then
+            return false
+        end
+    end
+    return true
+end
+
+--- What the search for project candidates depends on beyond research, recipes, bonuses, belts
+--- and the item balances (all the same after a warm Refresh): the building types you have, the
+--- recipes you use and the items set to unlimited. The same sig means the same candidates.
+---@param scan BCE.Scan
+---@param kept integer[]
+---@param modes table<string, string>
+---@return { entity: LuaEntityPrototype, quality: LuaQualityPrototype? }[] entities
+---@return table<string, true> used recipe names
+---@return string sig
+local function candidate_inputs(scan, kept, modes)
+    local rows = scan.rows
+    local entities, seen = {}, {}
+    for _, row in ipairs(rows) do
+        local conf = row.conf
+        if (conf and conf.type == "meta" and conf.children and conf.children[1]) then
+            conf = conf.children[1]
+        end
+        local e = conf and conf.type == "crafting-machine" and conf.entity
+        if (e and (e.type == "assembling-machine" or e.type == "furnace") and not e.fixed_recipe and not seen[e.name]) then
+            seen[e.name] = true
+            entities[#entities + 1] = { entity = e, quality = conf.quality }
+        end
+    end
+    table.sort(entities, function(a, b) return a.entity.name < b.entity.name end)
+    local used = {}
+    for _, ri in ipairs(kept) do
+        local conf = rows[ri].conf
+        if (conf and conf.type == "meta" and conf.children) then
+            for _, ch in ipairs(conf.children) do
+                if (ch.recipe) then
+                    used[ch.recipe.name] = true
+                end
+            end
+        elseif (conf and conf.recipe) then
+            used[conf.recipe.name] = true
+        end
+    end
+    local parts = {}
+    for _, e in ipairs(entities) do
+        parts[#parts + 1] = "e:" .. e.entity.name .. "/" .. (e.quality and e.quality.name or "")
+    end
+    local names = {}
+    for name, _ in pairs(used) do
+        names[#names + 1] = "r:" .. name
+    end
+    for id, m in pairs(modes) do
+        if (m == "ignored") then
+            names[#names + 1] = "i:" .. id
+        end
+    end
+    table.sort(names)
+    for _, s in ipairs(names) do
+        parts[#parts + 1] = s
+    end
+    return entities, used, table.concat(parts, "|")
+end
+
+--- Continues a solved model (built) for a new scan of the same factory: see "Warm Refresh".
+--- On false the caller builds cold (built may be partly changed only for "supplies (reopening)").
+---@param built table the last solved model, for old_scan
+---@param old_scan BCE.Scan
+---@param scan BCE.Scan the new scan
+---@param overrides table<string, string>
+---@param speeds table<string, number>
+---@return boolean ok
+---@return string why the outcome, for tests
+function model.warm_build(built, old_scan, scan, overrides, speeds)
+    local L = built and built.lp
+    if (not L or not built.col_of or not old_scan) then
+        return false, "no previous model"
+    end
+    if (L.status ~= "optimal") then
+        return false, "previous model not optimal"
+    end
+    if (built.warm_chain >= WARM_MAX_CHAIN) then
+        return false, "warm chain limit"
+    end
+    if (scan.surface_index ~= built.surface_index) then
+        return false, "surface"
+    end
+    if (scan.tech_sig ~= built.tech_sig) then
+        return false, "research, recipes or bonuses"
+    end
+    if (scan.lane_rate ~= built.lane) then
+        return false, "belts"
+    end
+    if (scan.use_analyzer ~= built.use_analyzer) then
+        return false, "analyzer setting"
+    end
+    for id, v in pairs(overrides) do
+        if (built.overrides[id] ~= v) then
+            return false, "unlimited items"
+        end
+    end
+    for id, v in pairs(built.overrides) do
+        if (overrides[id] ~= v) then
+            return false, "unlimited items"
+        end
+    end
+
+    local prep = model.prepare(scan, overrides, built.track_steam)
+    local need = prep.need_sorted
+    if (#need ~= #built.need_sorted) then
+        return false, "item balances"
+    end
+    for i, id in ipairs(need) do
+        if (built.need_sorted[i] ~= id) then
+            return false, "item balances"
+        end
+    end
+    local node_con = built.node_con
+    -- supplies and "any" transfers: the same
+    local n_sup = 0
+    for id, _ in pairs(prep.supply_ids) do
+        if (node_con[id]) then
+            if (not built.supply_vars[id]) then
+                return false, "supplies"
+            end
+            n_sup = n_sup + 1
+        end
+    end
+    if (n_sup ~= table_size(built.supply_vars)) then
+        return false, "supplies"
+    end
+    local tk = 0
+    for _, id in ipairs(need) do
+        for _, cid in ipairs(prep.nodes[id].children or {}) do
+            if (node_con[cid]) then
+                tk = tk + 1
+                local tr = built.transfers[tk]
+                if (not tr or tr.any ~= id or tr.child ~= cid) then
+                    return false, "fluid temperatures"
+                end
+            end
+        end
+    end
+    if (tk ~= #built.transfers) then
+        return false, "fluid temperatures"
+    end
+    if (model.target_signature(scan, prep.kept) ~= built.target_sig) then
+        return false, "targets"
+    end
+
+    -- match the groups
+    local rows = scan.rows
+    local have_of = have_counts(rows, prep.kept)
+    local bounds = {} ---@type { j: integer, value: number? }[] bound changes
+    local add = {} ---@type { col: table, cost: number, upper: number?, ri: integer, role: string }[]
+    local row_var, twin_var, col_of = {}, {}, {}
+    local used = {} ---@type table<string, true>
+    local changed = 0
+    local function bound(j, value)
+        if (L.upper[j] ~= value) then
+            bounds[#bounds + 1] = { j = j, value = value }
+            return true
+        end
+        return false
+    end
+    for _, ri in ipairs(prep.kept) do
+        local row = rows[ri]
+        local kind, ub, cv, ct = row_spec(row, have_of[ri], speeds, built.lane)
+        local col = row_column(row, node_con)
+        local old = built.col_of[row.key]
+        if (old) then
+            used[row.key] = true
+            if (not same_column(L.A[old.v], col) or (old.t and not same_column(L.A[old.t], col))) then
+                return false, "what a group makes changed: " .. row.key
+            end
+            local c = L.c[1]
+            if (kind == "target") then
+                if (not old.t or not close(c[old.v], cv) or not close(c[old.t], ct)) then
+                    return false, "target cost"
+                end
+                bound(old.v, ub)
+                row_var[ri], twin_var[ri] = old.v, old.t
+            elseif (old.t) then
+                -- had a column for the buildings you have and one beyond them
+                if (not close(c[old.t], ct or cv)) then
+                    return false, "cost changed: " .. row.key
+                end
+                if (kind == "have" and not close(c[old.v], cv)) then
+                    return false, "rent changed: " .. row.key
+                end
+                if (bound(old.v, kind == "have" and ub or 0)) then
+                    changed = changed + 1
+                end
+                row_var[ri], twin_var[ri] = old.v, old.t
+            else
+                -- had none of them: one column at hassle
+                if (not close(c[old.v], kind == "have" and ct or cv)) then
+                    return false, "cost changed: " .. row.key
+                end
+                if (kind == "have") then
+                    -- now you have some: a column for them, the old one goes beyond
+                    add[#add + 1] = { col = col, cost = cv, upper = ub, ri = ri, role = "v" }
+                    twin_var[ri] = old.v
+                    changed = changed + 1
+                else
+                    row_var[ri] = old.v
+                end
+            end
+        else
+            -- a group the last model didn't have
+            add[#add + 1] = { col = col, cost = cv, upper = ub, ri = ri, role = "v" }
+            if (ct) then
+                add[#add + 1] = { col = col, cost = ct, upper = nil, ri = ri, role = "t" }
+            end
+            changed = changed + 1
+        end
+    end
+    -- groups that are gone: locked at 0
+    local dead_now = 0
+    for key, cols in pairs(built.col_of) do
+        if (not used[key]) then
+            changed = changed + 1
+            bound(cols.v, 0)
+            if (cols.t) then
+                bound(cols.t, 0)
+            end
+        end
+    end
+    if (changed > math.max(WARM_MAX_CHANGED, WARM_MAX_CHANGED_SHARE * #prep.kept)) then
+        return false, "too many changes (" .. changed .. ")"
+    end
+    -- columns in use after this: groups, transfers, supplies
+    local live = #add + #built.transfers + n_sup
+    for _, ri in ipairs(prep.kept) do
+        live = live + (row_var[ri] and 1 or 0) + (twin_var[ri] and 1 or 0)
+    end
+    dead_now = (L.n + #add) - live
+    if (dead_now > WARM_MAX_DEAD_SHARE * (L.n + #add)) then
+        return false, "too many unused columns"
+    end
+
+    -- the checks passed: change the model. Supplies first, kept feasible (a capped supply at its
+    -- cap would otherwise jump to the open bound)
+    if (not model.uncap_supplies(built)) then
+        return false, "supplies (reopening)"
+    end
+    local cols, costs = {}, {}
+    for t, a in ipairs(add) do
+        cols[t], costs[t] = a.col, a.cost
+    end
+    local ids = lp.extend(L, cols, costs)
+    for t, a in ipairs(add) do
+        local j = ids[t]
+        if (a.role == "v") then
+            row_var[a.ri] = j
+        else
+            twin_var[a.ri] = j
+        end
+        lp.set_bound(L, j, a.upper)
+    end
+    for _, b in ipairs(bounds) do
+        lp.set_bound(L, b.j, b.value)
+    end
+    lp.commit_bounds(L)
+    for _, ri in ipairs(prep.kept) do
+        col_of[rows[ri].key] = { v = row_var[ri], t = twin_var[ri] }
+    end
+
+    built.kept = prep.kept
+    built.row_var, built.twin_var, built.col_of = row_var, twin_var, col_of
+    built.modes, built.defaults, built.nodes = prep.modes, prep.defaults, prep.nodes
+    built.caps, built.capped = nil, nil
+    -- projects: the candidates (and their locked columns) still hold if what they depend on is
+    -- the same; otherwise they are looked for again (the old columns stay locked)
+    if (built.cand_list and select(3, candidate_inputs(scan, prep.kept, prep.modes)) ~= built.cand_sig) then
+        built.cand_list, built.cand_var, built.cand_sig = nil, nil, nil
+    end
+    built.warm = true
+    built.warm_refresh = { work0 = L.work, changed = changed, added = #add, bounds = #bounds }
+    built.warm_chain = built.warm_chain + 1
+    return true, string.format("warm: %d groups changed, %d columns added, %d bounds%s", changed, #add, #bounds,
+        built.cand_list and ", candidates kept" or "")
 end
 
 --- Production statistics of the last hour, per second: what came in from outside the model.
@@ -1299,33 +1751,7 @@ end
 ---@param force LuaForce
 ---@param surface LuaSurface
 local function candidates_start(scan, built, force, surface)
-    local rows = scan.rows
-    local entities, seen = {}, {}
-    for _, row in ipairs(rows) do
-        local conf = row.conf
-        if (conf and conf.type == "meta" and conf.children and conf.children[1]) then
-            conf = conf.children[1]
-        end
-        local e = conf and conf.type == "crafting-machine" and conf.entity
-        if (e and (e.type == "assembling-machine" or e.type == "furnace") and not e.fixed_recipe and not seen[e.name]) then
-            seen[e.name] = true
-            entities[#entities + 1] = { entity = e, quality = conf.quality }
-        end
-    end
-    table.sort(entities, function(a, b) return a.entity.name < b.entity.name end)
-    local used = {}
-    for _, ri in ipairs(built.kept) do
-        local conf = rows[ri].conf
-        if (conf and conf.type == "meta" and conf.children) then
-            for _, ch in ipairs(conf.children) do
-                if (ch.recipe) then
-                    used[ch.recipe.name] = true
-                end
-            end
-        elseif (conf and conf.recipe) then
-            used[conf.recipe.name] = true
-        end
-    end
+    local entities, used, sig = candidate_inputs(scan, built.kept, built.modes)
     local recipes = {}
     for name, r in pairs(force.recipes) do
         local proto = prototypes.recipe[name]
@@ -1335,7 +1761,7 @@ local function candidates_start(scan, built, force, surface)
     end
     table.sort(recipes, function(a, b) return a.name < b.name end)
     return { force = force, surface = surface, lane = scan.lane_rate, entities = entities, recipes = recipes, ri = 1, ei = 1,
-        list = {} }
+        list = {}, sig = sig }
 end
 
 --- Tries recipe × building pairs until about `budget` production calculations are done.
@@ -1533,7 +1959,7 @@ function model.whatif_step(job, built, scan, budget)
             if (not candidates_step(job.cjob, built, math.max(1, budget * CALLS_PER_WORK))) then
                 return false
             end
-            built.cand_list = job.cjob.list
+            built.cand_list, built.cand_sig = job.cjob.list, job.cjob.sig
             job.cjob = nil
         end
         -- the columns and a pass over the plan: about as long as a tick of the solver

@@ -23,6 +23,10 @@ local DROP_TOL = 1e-14
 local TIE_TOL = 1e-12
 local BLAND_AFTER = 50
 local REINVERT_EVERY = 48
+--- Dual simplex (after lp.set_bound): smallest pivot taken, and how far outside its bounds a
+--- basic variable may be (relative to the bound) before it counts as infeasible.
+local DUAL_PIVOT_TOL = 1e-7
+local FEAS_TOL = 1e-9
 
 ---@class LP.Problem
 ---@field n integer
@@ -770,6 +774,122 @@ pivot = function(st, q, r, alpha, arow, value, to_upper)
     end
 end
 
+--- Dual simplex, for bounds changed with lp.set_bound: the basis stays, so the reduced costs
+--- stay optimal, but basic variables may now be outside their bounds. Each iteration takes the
+--- one furthest outside, moves it onto that bound and lets the nonbasic column enter that keeps
+--- the reduced costs closest to optimal (Harris' two-pass ratio test). Columns made usable since
+--- (dual infeasible) count as ratio 0; the primal iterations after this fix them.
+
+---@return integer? row
+---@return boolean to_upper
+local function choose_leaving(st)
+    local beta, basis, upper = st.beta, st.basis, st.upper
+    local r, worst, to_upper = nil, 0, false
+    for i = 1, st.m do
+        local v = beta[i]
+        if (v < -FEAS_TOL) then
+            if (-v > worst) then
+                r, worst, to_upper = i, -v, false
+            end
+        else
+            local ub = upper[basis[i]]
+            if (ub and v > ub + FEAS_TOL * (1 + ub)) then
+                if (v - ub > worst) then
+                    r, worst, to_upper = i, v - ub, true
+                end
+            end
+        end
+    end
+    st.work = st.work + st.m
+    return r, to_upper
+end
+
+--- One dual iteration. False when it can't go on (st.status says why); st.dual is cleared once
+--- every basic variable is within its bounds.
+---@return boolean
+local function dual_iterate(st)
+    local r, to_upper = choose_leaving(st)
+    if (not r) then
+        st.dual = nil
+        return true
+    end
+    st.dual_iterations = (st.dual_iterations or 0) + 1
+    if (st.dual_iterations > 20 * st.m + 1000) then
+        st.status = "dual_failed"
+        return false
+    end
+    local arow = pivot_row(st, r)
+    local pos, at_upper, upper, d, w, K = st.pos, st.at_upper, st.upper, st.d, st.weights, st.K
+    -- the leaving variable rises to 0 (s = -1) or falls to its upper bound (s = 1): an entering
+    -- column moving in its direction dir must have sign(alpha * dir) = s
+    local s = to_upper and 1 or -1
+    local tol = st.opt_tol or OPT_TOL
+    local cands, nc = {}, 0
+    local bound = INF
+    for j, a in pairs(arow) do
+        if (not pos[j] and upper[j] ~= 0) then
+            local dir = at_upper[j] and -1 or 1
+            local ad = a * dir * s
+            if (ad > DUAL_PIVOT_TOL) then
+                local dj = 0
+                for k = 1, K do
+                    dj = dj + w[k] * d[k][j]
+                end
+                -- optimal reduced cost: dir * dj >= 0
+                local slackness = dir * dj
+                if (slackness < 0) then
+                    slackness = 0
+                end
+                nc = nc + 1
+                cands[nc] = j
+                local rb = (slackness + tol) / ad
+                if (rb < bound) then
+                    bound = rb
+                end
+            end
+        end
+    end
+    st.work = st.work + nc * (K + 1)
+    local q, q_abs = nil, 0
+    for t = 1, nc do
+        local j = cands[t]
+        local a = arow[j]
+        local dir = at_upper[j] and -1 or 1
+        local ad = a * dir * s
+        local dj = 0
+        for k = 1, K do
+            dj = dj + w[k] * d[k][j]
+        end
+        local slackness = dir * dj
+        if (slackness < 0) then
+            slackness = 0
+        end
+        if (slackness / ad <= bound and ad > q_abs) then
+            q, q_abs = j, ad
+        end
+    end
+    if (not q) then
+        -- no column can bring it back: the new bounds have no solution
+        st.status = "dual_failed"
+        return false
+    end
+    local alpha = ftran(st, column(st, q))
+    local p = alpha[r]
+    if (not p or (p < 0 and -p or p) < DUAL_PIVOT_TOL) then
+        st.status = "dual_failed"
+        return false
+    end
+    local target = to_upper and upper[st.basis[r]] or 0
+    local dx = (st.beta[r] - target) / p
+    local beta = st.beta
+    for i, a in pairs(alpha) do
+        beta[i] = beta[i] - a * dx
+    end
+    st.iterations = st.iterations + 1
+    pivot(st, q, r, alpha, arow, start_value(st, q) + dx, to_upper)
+    return true
+end
+
 --- One simplex iteration. Returns false when finished.
 local function iterate(st)
     if (st.iterations >= st.max_iterations) then
@@ -796,7 +916,11 @@ function lp.step(st, budget, skip_final)
     end
     local stop_at = st.work + budget
     while (st.work < stop_at) do
-        if (not iterate(st)) then
+        if (st.dual) then
+            if (not dual_iterate(st)) then
+                return true
+            end
+        elseif (not iterate(st)) then
             if (not skip_final) then
                 -- final clean factorization so values and reduced costs are accurate
                 reinvert(st)
@@ -850,6 +974,45 @@ function lp.set_upper(st, j, value)
     st.iterations = 0
     st.degenerate_run = 0
     return true
+end
+
+--- Sets the upper bound of column j (nil: none, 0: locked) on a solved state, whatever the
+--- current solution: lp.commit_bounds then makes the changes take effect, and lp.step brings
+--- the solution back within its bounds (dual simplex) before it optimizes again. For many
+--- changes at once, such as a new scan of a factory that changed a little.
+---@param j integer a column (not a slack)
+---@param value number?
+function lp.set_bound(st, j, value)
+    local u = st.upper[j]
+    if (u == 0 and value ~= 0) then
+        -- unlock: into the row index (copied first: a fork may share the rows)
+        for i, a in pairs(st.A[j]) do
+            local row = {}
+            for k, v in pairs(st.rowA[i]) do
+                row[k] = v
+            end
+            row[j] = a
+            st.rowA[i] = row
+        end
+        st.at_upper[j] = nil
+    end
+    if (not st.pos[j] and st.at_upper[j] and (value == nil or value == 0)) then
+        -- nonbasic at an upper bound that is gone: at 0 instead
+        st.at_upper[j] = nil
+    end
+    st.upper[j] = value
+end
+
+--- After lp.set_bound: the basic values and reduced costs again from the basis, and the dual
+--- simplex armed for lp.step.
+function lp.commit_bounds(st)
+    refresh(st)
+    lp.update_tolerance(st)
+    st.status = "running"
+    st.iterations = 0
+    st.degenerate_run = 0
+    st.dual = true
+    st.dual_iterations = 0
 end
 
 --- Lower the upper bound of j to `value`, handing what j loses to k, a column identical to j

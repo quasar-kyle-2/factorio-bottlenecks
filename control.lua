@@ -48,11 +48,20 @@ local function start_projects(player)
     s.proj_job = job
 end
 
+--- Milestones that need the next Refresh to start from scratch (research, mod settings, forces):
+--- every model remembers the count it was built at, and a warm Refresh needs it unchanged.
+local function bump_cold_epoch()
+    storage.cold_epoch = (storage.cold_epoch or 0) + 1
+end
+
 --- Build the model from the last scan and start solving it over the next ticks. Once solved,
 --- its supplies are capped (model.cap_supplies) and it is solved again from there; then the
 --- results show. Projects wait for Recommend projects: their pane closes with every new answer.
+--- With `from` (a Refresh: the last solved model and its scan), it continues from that answer
+--- when the factory changed little enough (model.warm_build), instead of from scratch.
 ---@param player LuaPlayer
-local function start_solve(player)
+---@param from { built: table, scan: BCE.Scan }?
+local function start_solve(player, from)
     local s = gui.get_storage(player)
     if (not s.scan) then
         return
@@ -60,7 +69,21 @@ local function start_solve(player)
     s.stopped = nil
     s.proj_job = nil
     s.projects_open = nil
-    local built = model.build(s.scan, s.overrides, true, s.speeds)
+    local built
+    s.refresh_how = "cold"
+    if (from and from.built and from.built.epoch == (storage.cold_epoch or 0)) then
+        local ok, why = model.warm_build(from.built, from.scan, s.scan, s.overrides, s.speeds)
+        s.refresh_how = why
+        if (ok) then
+            built = from.built
+        end
+    elseif (from and from.built) then
+        s.refresh_how = "research or settings changed"
+    end
+    if (not built) then
+        built = model.build(s.scan, s.overrides, true, s.speeds)
+        built.epoch = storage.cold_epoch or 0
+    end
     s.built = built
     s.solved = nil
     s.result = nil
@@ -75,6 +98,8 @@ end
 ---@param player LuaPlayer
 local function run_scan(player)
     local s = gui.get_storage(player)
+    -- the last answer, to continue from (none while a solve runs: it isn't finished)
+    local from = (not s.built and s.solved and s.scan) and { built = s.solved, scan = s.scan } or nil
     s.stopped = nil
     local surface = s.surface_index and game.get_surface(s.surface_index)
     if (not surface) then
@@ -107,7 +132,7 @@ local function run_scan(player)
         scanned[id] = s.targets[id]
     end
     s.scanned_targets = scanned
-    start_solve(player)
+    start_solve(player, from)
 end
 
 gui.callbacks.rescan = run_scan
@@ -398,9 +423,19 @@ script.on_event(defines.events.on_tick, function(e)
             if (not player or not player.valid or not s.scan or not surface) then
                 s.built = nil
             elseif (not lp.step(built.lp, setting(player, "work-per-tick") --[[@as integer]])) then
-                if (e.tick % 2 == 0) then
+                local wr = built.warm_refresh
+                if (wr and built.cold_work and built.lp.work - wr.work0 > model.WARM_WORK_SHARE * built.cold_work) then
+                    -- continuing takes too long: from scratch after all
+                    s.built = nil
+                    start_solve(player)
+                    s.refresh_how = "warm gave up (work)"
+                elseif (e.tick % 2 == 0) then
                     gui.update_progress(player, progress_caption(built))
                 end
+            elseif (built.warm_refresh and built.lp.status ~= "optimal") then
+                s.built = nil
+                start_solve(player)
+                s.refresh_how = "warm gave up (" .. tostring(built.lp.status) .. ")"
             elseif (not built.capped and built.lp.status == "optimal"
                     and model.cap_supplies(built, player.force --[[@as LuaForce]], surface)) then
                 -- solved: now with the supplies capped, solved again from there
@@ -408,6 +443,13 @@ script.on_event(defines.events.on_tick, function(e)
                 s.built = nil
                 s.solved = built
                 built.warm = nil
+                built.warm_refresh = nil
+                if (built.cold) then
+                    -- the yardstick for how long a warm Refresh may take
+                    built.cold_work = built.lp.work
+                    built.cold = nil
+                    built.warm_chain = 0
+                end
                 s.result = model.results(built, s.scan, s.speeds)
                 gui.render(player, s.result)
             end
@@ -570,7 +612,26 @@ remote.add_interface("bottleneck-calc-extreme", {
     end,
 })
 
+-- milestones after which a Refresh starts from scratch
+script.on_event({
+    defines.events.on_research_finished,
+    defines.events.on_research_reversed,
+    defines.events.on_technology_effects_reset,
+    defines.events.on_force_reset,
+    defines.events.on_forces_merged,
+    defines.events.on_surface_cleared,
+}, bump_cold_epoch)
+
+script.on_event(defines.events.on_runtime_mod_setting_changed, function(e)
+    -- this mod's own settings don't change what the factory makes (the analyzer one is checked
+    -- by model.warm_build)
+    if (string.sub(e.setting, 1, 24) ~= "bottleneck-calc-extreme-") then
+        bump_cold_epoch()
+    end
+end)
+
 script.on_configuration_changed(function()
+    bump_cold_epoch()
     if (storage.players) then
         for _, player in pairs(game.players) do
             gui.force_close(player)

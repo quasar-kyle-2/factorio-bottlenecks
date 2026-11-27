@@ -16,6 +16,17 @@ Date: 2026-11-26
       each group, and the summary shows how many it adds for the item
     - Item report: a building group's tooltip lists its current effects: its modules and the
       beacons on it
+    - Refresh is much faster after small changes: when you've added or removed buildings, changed
+      their modules or recipes, or placed ghosts, it carries on from the last answer instead of
+      working everything out again, with the same result (on a large Pyanodon's base, about 10
+      seconds instead of a minute and a half, most of it the scan). It still starts from scratch
+      after research or a change to your unlocked recipes (Pyanodon's TURD choices included), a
+      change to mods or mod settings, unlimited items or targets, when the factory needs an item it
+      didn't before, or when a few hundred building groups changed at once. If carrying on takes
+      more than a quarter of the work a fresh start took last time, it starts over. "Recommend
+      projects" after such a Refresh also skips its first step, looking through every recipe you
+      could build, unless you've built a type of building you didn't have or started or stopped
+      using a recipe (on a large Pyanodon's base, about 4 seconds sooner)
   Changes:
     - The analysis pauses while the window is closed and carries on when you open it again,
       instead of slowing the game down in the background
