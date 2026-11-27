@@ -6,7 +6,9 @@ Date: 2026-11-26
       the most build cost (one-time effort) at the speeds you chose, each built fresh in a building
       type you have: how many to build, how much build cost and running cost they save (as bars, the
       numbers in the tooltips), and which new buildings they make unnecessary or need. They are
-      worked out after the results show
+      slow to work out, so only when you press "Recommend projects" in the Items pane; closing the
+      pane pauses the search, and finished recommendations stay until the next Refresh. The item
+      report's Productivity section waits while they are worked out
     - Items: a short item better handled by one of those projects gets a red "!", its tooltip
       naming the project
     - Item report: a "new" column in Goes to and Made by shows the new buildings the plan adds to
@@ -26,6 +28,9 @@ Date: 2026-11-26
       hand-feed) are counted, capped at what came in during the last hour
     - Item report: in Made by, building groups left below 100% while another group making the
       item runs past 100% get an info icon by "needed", explaining why they sit idle
+  Bugfixes:
+    - While the analysis runs, the window no longer stretches to the bottom of the screen, and the
+      Targets pane lines up with the edges
 ---------------------------------------------------------------------------------------------------
 Version: 1.1.1
 Date: 2026-11-24

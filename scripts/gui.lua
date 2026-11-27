@@ -5,7 +5,7 @@ local model = require("scripts.model")
 
 local gui = {
     events = {},
-    ---@type { rescan: fun(player: LuaPlayer), reset: fun(player: LuaPlayer), remove_targets: fun(player: LuaPlayer, unit_numbers: integer[]), restore_targets: fun(player: LuaPlayer, entities: LuaEntity[]), apply: fun(player: LuaPlayer, speeds: table<string, number>), set_speeds: fun(player: LuaPlayer, changes: table<string, number>), stop: fun(player: LuaPlayer), add_consumers: fun(player: LuaPlayer, type: string, name: string), toggle_item: fun(player: LuaPlayer, node_id: string), pick_tool: fun(player: LuaPlayer) }
+    ---@type { rescan: fun(player: LuaPlayer), reset: fun(player: LuaPlayer), remove_targets: fun(player: LuaPlayer, unit_numbers: integer[]), restore_targets: fun(player: LuaPlayer, entities: LuaEntity[]), apply: fun(player: LuaPlayer, speeds: table<string, number>), set_speeds: fun(player: LuaPlayer, changes: table<string, number>), stop: fun(player: LuaPlayer), open_projects: fun(player: LuaPlayer), close_projects: fun(player: LuaPlayer), add_consumers: fun(player: LuaPlayer, type: string, name: string), toggle_item: fun(player: LuaPlayer, node_id: string), pick_tool: fun(player: LuaPlayer) }
     callbacks = {},
 }
 
@@ -22,7 +22,8 @@ local main_window_name = "bottleneck-calc-extreme_wnd_main"
 ---@field scanned_targets? table<integer, LuaEntity> the targets the scan was made for; s.targets differing from it is a change waiting for Apply
 ---@field stopped? true the player stopped the last solve; Refresh starts again
 ---@field result? BCE.Result
----@field proj_job? table projects being tried on the solved model (model.whatif_step)
+---@field proj_job? table projects being tried on the solved model (model.whatif_step); paused while their pane is closed
+---@field projects_open? true the projects pane is shown (Recommend projects); they are only worked out while it is
 ---@field detail_item? string node id of the item report shown under the targets
 ---@field detail_missing? { type: string, name: string } picked for the report, but not on the surface
 ---@field detail_history? { list: { id: string?, missing: { type: string, name: string }? }[], pos: integer } reports viewed, for back and forward
@@ -47,15 +48,25 @@ local main_window_name = "bottleneck-calc-extreme_wnd_main"
 ---@field button_detail_close LuaGuiElement?
 ---@field button_stop LuaGuiElement
 ---@field pane_items LuaGuiElement
+---@field flow_left LuaGuiElement the left column (items, projects)
 ---@field pane_targets LuaGuiElement
 ---@field pane_detail LuaGuiElement
 ---@field pane_projects LuaGuiElement
 ---@field table_projects LuaGuiElement
+---@field button_recommend_projects LuaGuiElement
+---@field button_projects_close LuaGuiElement
 ---@field flow_right LuaGuiElement
 ---@field button_pick_tool LuaGuiElement?
 ---@field button_add_consumers LuaGuiElement
 ---@field label_add_consumers LuaGuiElement
 ---@field targets_locked boolean? the targets were drawn read-only, for a solve in progress
+
+--- Whether projects are being tried right now (a search paused by closing their pane is not).
+---@param s BCE.PlayerStorage
+---@return boolean
+function gui.projects_running(s)
+    return s.proj_job ~= nil and s.projects_open == true
+end
 
 ---@param player LuaPlayer
 ---@return BCE.PlayerStorage
@@ -195,6 +206,16 @@ end
 ---@param e EventData.on_gui_click
 local function on_stop_button_click(e)
     gui.callbacks.stop(game.get_player(e.player_index) --[[@as LuaPlayer]])
+end
+
+---@param e EventData.on_gui_click
+local function on_recommend_projects_click(e)
+    gui.callbacks.open_projects(game.get_player(e.player_index) --[[@as LuaPlayer]])
+end
+
+---@param e EventData.on_gui_click
+local function on_projects_close_click(e)
+    gui.callbacks.close_projects(game.get_player(e.player_index) --[[@as LuaPlayer]])
 end
 
 --- What a signal slot holds, if it is an item or a fluid (a ghost or an item in the cursor, or
@@ -387,7 +408,8 @@ local function on_apply_speeds_click(e)
     end
 end
 
---- The window always takes this much of the screen's height; its panes stretch to fill it.
+--- With results the window takes this much of the screen's height and its panes stretch to fill
+--- it; with only the targets showing (no results yet) it shrinks to fit them.
 local WINDOW_HEIGHT_FRACTION = 0.85
 
 ---@param player LuaPlayer
@@ -396,14 +418,33 @@ local function get_max_height(player)
     return player.display_resolution.height / player.display_scale * WINDOW_HEIGHT_FRACTION
 end
 
+--- Whether a pane that stretches down to the bottom is showing.
+---@param ui BCE.GuiElements
+---@return boolean
+local function has_fill_pane(ui)
+    return ui.pane_items.visible or ui.pane_detail.visible or ui.pane_projects.visible
+end
+
+---@param player LuaPlayer
+---@param ui BCE.GuiElements
+local function apply_window_height(player, ui)
+    local style = ui.wnd_main.style
+    local max = get_max_height(player)
+    if (has_fill_pane(ui)) then
+        style.height = max
+    else
+        style.minimal_height = 0
+        style.maximal_height = max
+    end
+end
+
 ---@param player LuaPlayer
 local function resize_main_window(player)
     local s = gui.get_storage(player)
     if (s.gui) then
         local wnd_main = s.gui.wnd_main
         if (wnd_main and wnd_main.valid) then
-            wnd_main.style.maximal_height = get_max_height(player)
-            wnd_main.style.height = get_max_height(player)
+            apply_window_height(player, s.gui)
         else
             close_main_window(player)
         end
@@ -425,6 +466,8 @@ flib_gui.add_handlers({
     on_rescan_button_click = on_rescan_button_click,
     on_reset_button_click = on_reset_button_click,
     on_stop_button_click = on_stop_button_click,
+    on_recommend_projects_click = on_recommend_projects_click,
+    on_projects_close_click = on_projects_close_click,
     on_pick_tool_click = on_pick_tool_click,
     on_item_button_click = on_item_button_click,
     on_consumers_elem_changed = on_consumers_elem_changed,
@@ -495,8 +538,8 @@ end
 ---@return BCE.GuiElements
 function gui.build(player)
     local s = gui.get_storage(player)
-    -- table_projects: a window from an older version of the mod gets rebuilt
-    if (s.gui and s.gui.wnd_main.valid and s.gui.table_projects) then
+    -- button_projects_close: a window from an older version of the mod gets rebuilt
+    if (s.gui and s.gui.wnd_main.valid and s.gui.button_projects_close) then
         return s.gui
     end
     local existing = player.gui.screen[main_window_name]
@@ -565,7 +608,20 @@ function gui.build(player)
         name = "table_items",
         direction = "vertical",
         style_mods = { minimal_width = compact and 0 or 520, vertical_spacing = 0, left_padding = 8, right_padding = 8 },
-    }, nil, "pane_items", true)
+    }, nil, "pane_items", true, {
+        {
+            -- the projects are slow to work out: only on request
+            type = "button",
+            name = "button_recommend_projects",
+            style = "frame_button",
+            caption = { "gui.bottleneck-calc-extreme-recommend-projects" },
+            tooltip = { "gui.bottleneck-calc-extreme-recommend-projects-tooltip" },
+            mouse_button_filter = { "left" },
+            style_mods = { height = 24, left_padding = 8, right_padding = 8, font = "default-semibold",
+                font_color = { 1, 1, 1 }, hovered_font_color = { 0, 0, 0 }, clicked_font_color = { 0, 0, 0 } },
+            handler = { [defines.events.on_gui_click] = on_recommend_projects_click },
+        },
+    })
     items_pane.style_mods = { vertically_stretchable = true }
     -- right half: the targets, and under them the item report
     local targets_pane = pane({ "gui.bottleneck-calc-extreme-pane-targets" }, {
@@ -580,10 +636,21 @@ function gui.build(player)
         name = "table_projects",
         direction = "vertical",
         style_mods = { vertical_spacing = 4, left_padding = 8, right_padding = 8 },
-    }, "projects", "pane_projects", true, nil, "scroll_projects")
+    }, "projects", "pane_projects", true, {
+        {
+            type = "sprite-button",
+            name = "button_projects_close",
+            style = "frame_action_button",
+            sprite = "utility/close",
+            tooltip = { "gui.bottleneck-calc-extreme-projects-close" },
+            mouse_button_filter = { "left" },
+            handler = { [defines.events.on_gui_click] = on_projects_close_click },
+        },
+    }, "scroll_projects")
     projects_pane.style_mods = { horizontally_stretchable = true, vertically_stretchable = true }
     panes[#panes + 1] = {
         type = "flow",
+        name = "flow_left",
         style = "inset_frame_container_vertical_flow",
         direction = "vertical",
         style_mods = { vertically_stretchable = true },
@@ -719,7 +786,7 @@ local function update_visibility(s)
     if (not (ui and ui.wnd_main.valid and ui.button_stop)) then
         return
     end
-    ui.button_stop.visible = s.built ~= nil or s.proj_job ~= nil
+    ui.button_stop.visible = s.built ~= nil
     -- nothing that changes the targets while solving: cancel or wait first (Refresh and Reset
     -- start over, so they stay)
     if (ui.button_pick_tool) then
@@ -737,7 +804,13 @@ local function update_visibility(s)
     ui.flow_right.visible = true
     -- the item report goes with the results, even when it only says to click an item
     ui.pane_detail.visible = s.result ~= nil
-    ui.pane_projects.visible = s.result ~= nil and #ui.table_projects.children > 0
+    ui.pane_projects.visible = s.result ~= nil and s.projects_open == true and #ui.table_projects.children > 0
+    -- projects need an answer the solver finished
+    ui.button_recommend_projects.visible = not s.projects_open and s.solved ~= nil
+        and s.solved.lp.status == "optimal"
+    -- an empty column would still take up the flow's spacing, pushing the right one over
+    ui.flow_left.visible = ui.pane_items.visible or ui.pane_projects.visible
+    apply_window_height(game.get_player(ui.wnd_main.player_index) --[[@as LuaPlayer]], ui)
 end
 
 ---@param player LuaPlayer
@@ -1857,8 +1930,10 @@ render_prod = function(s)
     if (job.phase ~= "done") then
         detail_separator(holder)
         detail_caption(holder, { "gui.bottleneck-calc-extreme-detail-prod" }, "prod")
-        flib_gui.add(holder, { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-prod-calculating" },
-            style_mods = { font_color = color_grey } })
+        -- it waits while projects are tried, so the two don't slow the game down together
+        flib_gui.add(holder, { type = "label", style_mods = { font_color = color_grey },
+            caption = { gui.projects_running(s) and "gui.bottleneck-calc-extreme-detail-prod-waiting"
+                or "gui.bottleneck-calc-extreme-detail-prod-calculating" } })
         return
     end
     if (job.pulling == 0) then
@@ -2252,8 +2327,11 @@ render_detail = function(parent, s, result)
         if (not job or job.result ~= result or job.id ~= d.id) then
             job = detail.productivity_start(s.scan, result, d.id, player.force)
             s.prod_job = job
-            -- a small one is done right away, without a "calculating" flash
-            detail.productivity_step(job, detail.PROD_WORK_PER_TICK)
+            -- a small one is done right away, without a "calculating" flash (not while projects
+            -- are tried: then it waits)
+            if (not gui.projects_running(s)) then
+                detail.productivity_step(job, detail.PROD_WORK_PER_TICK)
+            end
         end
     else
         s.prod_job = nil
@@ -2327,10 +2405,6 @@ render_projects = function(s)
             flib_gui.add(holder, { type = "label", style_mods = grey, caption = { "gui.bottleneck-calc-extreme-projects-trying",
                 tostring(math.min(job.k, #job.tests)), tostring(#job.tests) } })
         end
-        return
-    end
-    if (pr.stopped) then
-        flib_gui.add(holder, { type = "label", style_mods = grey, caption = { "gui.bottleneck-calc-extreme-projects-stopped" } })
         return
     end
     flib_gui.add(holder, { type = "label", visible = not compact, style_mods = { single_line = false, maximal_width = DETAIL_WIDTH - 40 },

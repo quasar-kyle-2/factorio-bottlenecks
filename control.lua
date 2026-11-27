@@ -30,9 +30,27 @@ local function progress_caption(built)
     return { "gui.bottleneck-calc-extreme-solving", tostring(math.floor(pct)) }
 end
 
+--- Starts looking for projects (s.proj_job) on the last answer, if the projects pane is open and
+--- they haven't been worked out for this answer yet. A search paused by closing the pane carries
+--- on where it was instead (the tick only works on it while the pane is open). The report's
+--- Productivity section waits while it runs, so the two never add up to more lag.
+---@param player LuaPlayer
+local function start_projects(player)
+    local s = gui.get_storage(player)
+    local built = s.solved
+    local surface = s.scan and game.get_surface(s.scan.surface_index)
+    if (not s.projects_open or s.built or s.proj_job or not s.result or s.result.projects
+            or not built or built.lp.status ~= "optimal" or not surface) then
+        return
+    end
+    local job = model.whatif_start(built, s.scan, player.force --[[@as LuaForce]], surface)
+    job.result, job.built = s.result, built
+    s.proj_job = job
+end
+
 --- Build the model from the last scan and start solving it over the next ticks. Once solved,
 --- its supplies are capped (model.cap_supplies) and it is solved again from there; then the
---- results show, and projects are looked for and tried (s.proj_job).
+--- results show. Projects wait for Recommend projects: their pane closes with every new answer.
 ---@param player LuaPlayer
 local function start_solve(player)
     local s = gui.get_storage(player)
@@ -41,6 +59,7 @@ local function start_solve(player)
     end
     s.stopped = nil
     s.proj_job = nil
+    s.projects_open = nil
     local built = model.build(s.scan, s.overrides, true, s.speeds)
     s.built = built
     s.solved = nil
@@ -75,6 +94,7 @@ local function run_scan(player)
     if (not any) then
         -- clean slate: an empty window, ready for "add consumers"
         s.scan, s.built, s.solved, s.result, s.scanned_targets = nil, nil, nil, nil, nil
+        s.proj_job, s.projects_open = nil, nil
         gui.show_progress(player, { "gui.bottleneck-calc-extreme-empty" })
         return
     end
@@ -147,6 +167,7 @@ gui.callbacks.set_speeds = function(player, changes)
     local built = (not s.built) and s.solved or nil
     -- the projects were tried on the answer that is about to change
     s.proj_job = nil
+    s.projects_open = nil
     local warm = built ~= nil and s.scan ~= nil and model.uncap_supplies(built)
     for row_key, speed in pairs(changes) do
         s.speeds[row_key] = (math.abs(speed - 1) > 1e-9) and speed or nil
@@ -213,18 +234,36 @@ end
 gui.callbacks.stop = function(player)
     local s = gui.get_storage(player)
     if (not s.built) then
-        -- trying projects: stop that, the results stay
-        if (s.proj_job and s.result) then
-            s.proj_job = nil
-            s.result.projects = { stopped = true }
-            gui.render(player, s.result)
-        end
         return
     end
     -- pending speeds stay: the targets still show, with their Apply button
     s.built, s.solved, s.result = nil, nil, nil
     s.stopped = true
     gui.show_progress(player, { "gui.bottleneck-calc-extreme-stopped" })
+end
+
+--- Recommend projects: show their pane, and work them out unless they were for this answer.
+gui.callbacks.open_projects = function(player)
+    local s = gui.get_storage(player)
+    s.projects_open = true
+    start_projects(player)
+    if (s.result and not s.built) then
+        gui.render(player, s.result)
+    end
+end
+
+--- The projects pane's close button: hide it. A search still running pauses (and its lag), to
+--- carry on when the pane opens again; finished projects are kept for then too.
+gui.callbacks.close_projects = function(player)
+    local s = gui.get_storage(player)
+    s.projects_open = nil
+    if (s.proj_job) then
+        -- the project being tried starts over: a half-solved copy of the model is too big to keep
+        s.proj_job.fork = nil
+    end
+    if (s.result and not s.built) then
+        gui.render(player, s.result)
+    end
 end
 
 gui.callbacks.reset = function(player)
@@ -251,6 +290,7 @@ show_window = function(player)
     if (s.built) then
         gui.show_progress(player, progress_caption(s.built))
     elseif (s.result) then
+        start_projects(player)
         gui.render(player, s.result)
     elseif (s.stopped) then
         gui.show_progress(player, { "gui.bottleneck-calc-extreme-stopped" })
@@ -368,20 +408,17 @@ script.on_event(defines.events.on_tick, function(e)
                 s.solved = built
                 built.warm = nil
                 s.result = model.results(built, s.scan, s.speeds)
-                -- the projects next, a little each tick, on copies of this answer
-                if (built.lp.status == "optimal") then
-                    local job = model.whatif_start(built, s.scan, player.force --[[@as LuaForce]], surface)
-                    job.result, job.built = s.result, built
-                    s.proj_job = job
-                end
                 gui.render(player, s.result)
             end
         end
         local pj = s.proj_job
-        if (pj and not s.built) then
+        if (pj and not s.built and s.projects_open) then
             local player = game.get_player(player_index)
             if (not player or not player.valid or pj.result ~= s.result or pj.built ~= s.solved or not s.scan) then
                 s.proj_job = nil
+                if (player and player.valid) then
+                    gui.update_prod(player) -- no longer waiting
+                end
             elseif (model.whatif_step(pj, s.solved, s.scan, setting(player, "work-per-tick") --[[@as integer]])) then
                 s.proj_job = nil
                 s.result.projects = model.whatif_finish(pj, s.solved, s.scan, s.result)
@@ -390,9 +427,9 @@ script.on_event(defines.events.on_tick, function(e)
                 gui.update_projects(player)
             end
         end
-        -- the report's Productivity section, a little each tick
+        -- the report's Productivity section, a little each tick; it waits while projects are tried
         local job = s.prod_job
-        if (job and job.phase ~= "done") then
+        if (job and job.phase ~= "done" and not gui.projects_running(s)) then
             if (job.result ~= s.result or job.id ~= s.detail_item) then
                 s.prod_job = nil
             elseif (detail.productivity_step(job, detail.PROD_WORK_PER_TICK)) then
