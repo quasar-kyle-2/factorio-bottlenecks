@@ -2264,7 +2264,7 @@ end
 -- ---------------------------------------------------------------------------
 -- projects pane
 
---- Width of the saves and rent savings bars.
+--- Width of the build cost and running cost savings bars.
 local BAR_WIDTH = 90
 local BAR_COLOR = { r = 0.2, g = 1, b = 0.2 }
 --- Rows listed in a project's "no longer needed" and "more needed" columns.

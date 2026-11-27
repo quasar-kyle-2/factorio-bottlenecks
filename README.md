@@ -37,8 +37,14 @@ progress bar and a stop button. Speed changes continue from the last answer, so 
 under a second even on a large base.
 
 - It uses the buildings you already have first, and only plans past them where it has to,
-  pricing each extra building by how hard it is to fit in (its "hassle"). One more building of a
-  group you have is cheaper than a new one, since its belts are already there.
+  pricing each extra building by how hard it is to fit in (its build cost): its width, a belt,
+  pipe or fuel for each thing it uses or makes (plus half for each extra lane when one lane of
+  your best belt can't carry it), and 0.05 per MW of power it draws, for the power plant behind
+  it. One more building of a group you have is cheaper than a new one, since its belts are
+  already there.
+- Between plans of about the same build cost, it picks the one with the lowest running cost
+  (items and fluids handled, and energy), so a power-hungry route doesn't win just because its
+  buildings are idle.
 - Each item is counted as if everything it needs were there, so a shortage upstream never hides
   what's needed further down.
 - Planned changes count as done: ghosts, pending upgrades and module requests are included.
@@ -50,7 +56,7 @@ under a second even on a large base.
   at what came in during the last hour.
 - After the results show, it looks for projects: every recipe you have unlocked but don't use,
   in every building type you have. The 40 most promising at the plan's prices are each tried on
-  a copy of the solved plan, and the 10 that save the most hassle are listed, with how much
+  a copy of the solved plan, and the 10 that save the most build cost are listed, with how much
   running cost they save.
 
 ## Settings (per player)

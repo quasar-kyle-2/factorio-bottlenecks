@@ -3,8 +3,8 @@ Version: 1.1.2
 Date: 2026-11-26
   Features:
     - Project recommendations: a new pane lists the 10 recipes you don't use yet that would save
-      the most effort ("hassle") at the speeds you chose, each built fresh in a building type you
-      have: how many to build, how much hassle and running cost ("rent") they save (as bars, the
+      the most build cost (one-time effort) at the speeds you chose, each built fresh in a building
+      type you have: how many to build, how much build cost and running cost they save (as bars, the
       numbers in the tooltips), and which new buildings they make unnecessary or need. They are
       worked out after the results show
     - Items: a short item better handled by one of those projects gets a red "!", its tooltip
@@ -12,8 +12,13 @@ Date: 2026-11-26
     - Item report: a "new" column in Goes to and Made by shows the new buildings the plan adds to
       each group, and the summary shows how many it adds for the item
   Changes:
-    - Extra buildings are planned by hassle: one more building of a group you have costs less than
+    - Extra buildings are planned by build cost: one more building of a group you have costs less than
       a new one, since its belts and pipes are already there
+    - Build cost counts belt lanes: an item one lane of your best belt can't carry pays half for
+      each extra lane. It also counts power: 0.05 per MW a new building draws, for the power plant
+      behind it
+    - Between plans of about the same build cost, the one with the lowest running cost wins, instead of
+      the one that uses the smallest share of each group of your buildings
     - Steam, water at other than its default temperature and waste that recipes make are counted
       like any other item. The "Track steam" setting is gone
     - Fuels made for one kind of building (drill heads, fuel rods) are counted as ingredients

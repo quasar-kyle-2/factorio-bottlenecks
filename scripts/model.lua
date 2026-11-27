@@ -266,6 +266,7 @@ end
 ---@field target_entities integer
 ---@field target_entities_without_conf integer
 ---@field planned_changes integer ghosts, queued upgrades and pending module requests counted in
+---@field lane_rate number? items per second on one lane of the best belt unlocked (model.lane_rate)
 
 --- Running cost ("rent", ongoing, per building-second), YAFC's definition of work: 0.02 per item
 --- and 0.0005 per fluid unit going in or out, and 0.1 per MJ of energy (electricity, heat, fuel).
@@ -452,6 +453,7 @@ function model.scan(surface, force, target_ids, use_analyzer)
         target_entities_without_conf = target_without_conf,
         planned_changes = planned,
         fake_items = fake_items,
+        lane_rate = model.lane_rate(force),
     }
 end
 
@@ -580,10 +582,11 @@ end
 --              them by script) get a supply column, capped at what the factory made in the last
 --              hour (or what the plan uses, if more): model.cap_supplies, after a first solve
 --   objective: run the targets at their speed first; then keep the hassle of the extra
---              buildings low: a clone of a group you have costs its width plus a quarter of
---              its connections (its belts and pipes are there already), however many of it you
---              have; then use as few of your own buildings as possible, each counted relative to
---              how many you have of it
+--              buildings low (model.clone_hassle: a clone of a group you have costs its width,
+--              a quarter of its connections since its belts and pipes are there already, plus
+--              belt lanes beyond the first and its power in full); then, between plans of about
+--              the same hassle, the lowest rent (running cost) of every building running, yours
+--              included. Your own buildings cost nothing but their rent.
 --
 -- Per item: needed = what the chain uses at those rates; can make = what the buildings it uses
 -- to make the item would make at 100% with the buildings you have, plus its supply. Coverage =
@@ -599,8 +602,11 @@ local EPS = 1e-7
 local W_TARGET = 1e4
 --- per unit of hassle, for each building beyond the ones you have
 local W_OVER = 1e-2
---- per building you have, relative to how many you have
-local W_BUILDINGS = 1e-3
+--- per unit of rent (running cost per second) of every building running, yours or extra: only
+--- decides between plans of about the same hassle (100 rent per second weighs 0.1 hassle)
+local W_RENT = 1e-5
+--- Rent floor, so no building runs for free.
+local MIN_RENT = 1e-2
 --- Buildings running less than this are solver noise.
 local RUN_TOL = 1e-6
 --- Items needed or made slower than this per second are solver noise.
@@ -608,54 +614,117 @@ local NEED_TOL = 1e-4
 --- Upper bound of a supply column until it is capped.
 local SUPPLY_OPEN = 1e9
 
---- What a new building of a row takes to fit in (its hassle): its width in tiles, a belt, pipe
---- or inserter for each item and fluid it uses or makes, a heat pipe if it runs on heat, and fuel
---- (plus its burnt result) if it burns something. Default-temperature water it makes costs
---- nothing: it can be voided or left. Whatever you already have of it.
----@param row { conf: Rates.Configuration, amounts: { node: Rates.Node, amount: number }[] }
+--- Hassle of the power plant behind one MW of electricity a new building draws: flat, and
+--- conservative for a late Pyanodon's base (about 0.03 there: a coal power plant MK03 and its
+--- share of heat exchangers and turbine make about 450 MW).
+local HASSLE_PER_MW = 0.05
+--- Items per second on one lane of a yellow belt: the lane size before any belt is unlocked.
+local YELLOW_LANE = 7.5
+
+--- Items per second on one lane of the fastest belt the force has unlocked (yellow if none).
+--- Read once per scan.
+---@param force LuaForce
 ---@return number
-local function building_cost(row)
-    local proto = row.conf and row.conf.entity
-    local cost = 0
-    local ok = proto and pcall(function()
-        cost = proto.tile_width or 3
-        if (proto.heat_energy_source_prototype) then
-            cost = cost + 1
-        end
-        if (proto.burner_prototype) then
-            cost = cost + 2
-        elseif (proto.fluid_energy_source_prototype) then
-            cost = cost + 1
+function model.lane_rate(force)
+    local best = YELLOW_LANE
+    pcall(function()
+        for _, belt in pairs(prototypes.get_entity_filtered { { filter = "type", type = "transport-belt" } }) do
+            local rate = belt.belt_speed * 480 / 2
+            if (rate > best and not belt.hidden) then
+                for _, place in ipairs(belt.items_to_place_this or {}) do
+                    local name = type(place) == "table" and place.name or place
+                    local made = prototypes.get_recipe_filtered { { filter = "has-product-item",
+                        elem_filters = { { filter = "name", name = name } } } }
+                    for rname, _ in pairs(made) do
+                        local r = force.recipes[rname]
+                        if (r and r.enabled) then
+                            best = rate
+                            break
+                        end
+                    end
+                    if (best == rate) then
+                        break
+                    end
+                end
+            end
         end
     end)
-    if (not ok) then
-        cost = 3
-    end
-    for _, a in ipairs(row.amounts) do
-        local t = a.node.type
-        if ((t == "item" or t == "fluid" or t == "any") and not (a.amount > 0 and is_water15(a.node))) then
-            cost = cost + 1
-        end
-    end
-    return cost
+    return best
 end
 
---- Hassle of one more building of a group you have: its width, plus a quarter of the rest of
---- building_cost, since its belts and pipes are already there.
----@param row BCE.Row
----@return number
-function model.clone_hassle(row)
-    local full = building_cost(row)
+--- The parts of a building's hassle (see building_cost and model.clone_hassle).
+---@param row { conf: Rates.Configuration, amounts: { node: Rates.Node, amount: number }[] }
+---@param lane number? items per second on one belt lane (model.lane_rate)
+---@return number width
+---@return number links one per item, fluid, heat pipe or fuel it needs (see building_cost)
+---@return number lanes half of the belt lanes beyond the first that its items need
+---@return number power hassle of the power it draws
+local function hassle_parts(row, lane)
+    lane = lane or YELLOW_LANE
     local conf = row.conf
     if (conf and conf.type == "meta" and conf.children and conf.children[1]) then
         conf = conf.children[1]
     end
-    local width = 3
     local proto = conf and conf.entity
+    local width, links, lanes, power = 3, 0, 0, 0
     if (proto) then
-        pcall(function() width = proto.tile_width end)
+        pcall(function()
+            width = proto.tile_width or 3
+            if (proto.heat_energy_source_prototype) then
+                links = links + 1
+            end
+            if (proto.burner_prototype) then
+                links = links + 2
+            elseif (proto.fluid_energy_source_prototype) then
+                links = links + 1
+            end
+        end)
+        pcall(function()
+            local source = proto.electric_energy_source_prototype
+            if (source) then
+                -- base draw: no modules, no beacons
+                local per_tick = proto.get_max_energy_usage(conf.quality) + (source.drain or 0)
+                power = HASSLE_PER_MW * per_tick * 60 / 1e6
+            end
+        end)
     end
-    return width + 0.25 * math.max(0, full - width)
+    for _, a in ipairs(row.amounts) do
+        local t = a.node.type
+        if ((t == "item" or t == "fluid" or t == "any") and not (a.amount > 0 and is_water15(a.node))) then
+            links = links + 1
+            if (t == "item") then
+                -- the first lane is the link itself; each further lane is half a belt
+                lanes = lanes + 0.5 * math.max(0, math.abs(a.amount) / lane - 1)
+            end
+        end
+    end
+    return width, links, lanes, power
+end
+
+--- What a new building of a row takes to fit in (its hassle): its width in tiles, a belt lane,
+--- pipe or inserter for each item and fluid it uses or makes, a heat pipe if it runs on heat,
+--- and fuel (plus its burnt result) if it burns something. An item needing more than one lane
+--- of the best belt you have pays half for each further lane, since a lane is half a belt
+--- (fractions too: neighbors share them). The
+--- power it draws pays HASSLE_PER_MW for the plant behind it. Default-temperature water it
+--- makes costs nothing: it can be voided or left. Whatever you already have of it.
+---@param row { conf: Rates.Configuration, amounts: { node: Rates.Node, amount: number }[] }
+---@param lane number? items per second on one belt lane (model.lane_rate)
+---@return number
+local function building_cost(row, lane)
+    local width, links, lanes, power = hassle_parts(row, lane)
+    return width + links + lanes + power
+end
+
+--- Hassle of one more building of a group you have: its width, plus a quarter of its links,
+--- since its belts and pipes are already there. Lanes beyond the first and power are paid in
+--- full: a full belt or power plant doesn't get emptier because the group exists.
+---@param row BCE.Row
+---@param lane number? items per second on one belt lane (model.lane_rate)
+---@return number
+function model.clone_hassle(row, lane)
+    local width, links, lanes, power = hassle_parts(row, lane)
+    return width + 0.25 * links + lanes + power
 end
 
 ---@class BCE.Prep
@@ -752,6 +821,7 @@ function model.build(scan, overrides, track_steam, speeds, prep)
     local rows = scan.rows
     prep = prep or model.prepare(scan, overrides, track_steam)
     local nodes, kept, need_sorted, node_con = prep.nodes, prep.kept, prep.need_sorted, prep.node_con
+    local lane = scan.lane_rate
 
     local n, m = 0, 0
     local cols, upper, cost = {}, {}, {}
@@ -795,16 +865,17 @@ function model.build(scan, overrides, track_steam, speeds, prep)
             for meta_id, k in pairs(row.count_groups or {}) do
                 have = have + k / meta_children[meta_id]
             end
+            local rent = W_RENT * math.max(row.rent or 0, MIN_RENT)
             if (have > 0) then
                 local v = var(have)
-                cost[v] = W_BUILDINGS / count
+                cost[v] = rent
                 row_var[ri] = v
                 local o = var(nil)
-                cost[o] = W_OVER * model.clone_hassle(row)
+                cost[o] = W_OVER * model.clone_hassle(row, lane) + rent
                 twin_var[ri] = o
             else
                 local v = var(nil)
-                cost[v] = W_OVER * model.clone_hassle(row)
+                cost[v] = W_OVER * model.clone_hassle(row, lane) + rent
                 row_var[ri] = v
             end
         end
@@ -1173,7 +1244,7 @@ local CALLS_PER_WORK = 1 / 1250
 ---@field entity LuaEntityPrototype
 ---@field quality LuaQualityPrototype
 ---@field amounts { id: string, node: Rates.Node, amount: number }[] per building
----@field fit number hassle of one new building (building_cost)
+---@field hassle number hassle of one new building (building_cost)
 ---@field rent number running cost of one building per second
 
 local function can_craft(entity, recipe)
@@ -1263,7 +1334,8 @@ local function candidates_start(scan, built, force, surface)
         end
     end
     table.sort(recipes, function(a, b) return a.name < b.name end)
-    return { force = force, surface = surface, entities = entities, recipes = recipes, ri = 1, ei = 1, list = {} }
+    return { force = force, surface = surface, lane = scan.lane_rate, entities = entities, recipes = recipes, ri = 1, ei = 1,
+        list = {} }
 end
 
 --- Tries recipe × building pairs until about `budget` production calculations are done.
@@ -1287,7 +1359,7 @@ local function candidates_step(cjob, built, budget)
                 local summed = sum_amounts(raw)
                 if (plan_can_feed(summed, built)) then
                     cjob.list[#cjob.list + 1] = { n = #cjob.list + 1, recipe = proto, entity = e.entity, quality = e.quality, amounts = summed,
-                        fit = building_cost({ conf = cconf, amounts = summed }), rent = running_cost(raw) }
+                        hassle = building_cost({ conf = cconf, amounts = summed }, cjob.lane), rent = running_cost(raw) }
                 end
             end
         else
@@ -1335,7 +1407,7 @@ function model.screen(built, cands)
                 end
             end
         end
-        local score = v - c.fit
+        local score = v - c.hassle
         if (score > 1e-6) then
             list[#list + 1] = { ci = ci, score = score, main = main or "?" }
         end
@@ -1359,7 +1431,7 @@ function model.screen(built, cands)
     return pool
 end
 
---- The objective of a solved state, in hassle.
+--- The objective of a solved state, in hassle (with the rent tiebreak in it).
 local function objective(L)
     local c, total = L.c[1], 0
     for j = 1, L.n do
@@ -1410,7 +1482,7 @@ local function whatif_prepare(job, built, scan)
                 end
             end
             cols[#cols + 1] = col
-            costs[#costs + 1] = W_OVER * c.fit
+            costs[#costs + 1] = W_OVER * c.hassle + W_RENT * math.max(c.rent, MIN_RENT)
             added[#added + 1] = c
         end
     end
@@ -1448,7 +1520,9 @@ local function whatif_read(job, built, scan, fork, test)
     end
     local x = lp.value(fork, test.var)
     drent = drent + x * test.cand.rent
-    job.results[#job.results + 1] = { cand = test.cand, saved = job.obj0 - objective(fork), x = x, drent = drent, diff = diff }
+    -- the objective also holds the rent tiebreak: take it out, so saved is hassle alone
+    local saved = job.obj0 - objective(fork) + drent * W_RENT / W_OVER
+    job.results[#job.results + 1] = { cand = test.cand, saved = saved, x = x, drent = drent, diff = diff }
 end
 
 --- Looks for projects and tries them, until about `budget` units of solver work are done.
@@ -1545,7 +1619,7 @@ function model.whatif_finish(job, built, scan, result)
     for ri, x in pairs(result.row_extra) do
         if (x > 1e-3) then
             n = n + x
-            h = h + x * model.clone_hassle(scan.rows[ri])
+            h = h + x * model.clone_hassle(scan.rows[ri], scan.lane_rate)
         end
     end
     return { tested = #job.results, extra_buildings = n, extra_hassle = h, list = list }
