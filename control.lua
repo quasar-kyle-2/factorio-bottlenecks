@@ -248,21 +248,17 @@ gui.callbacks.open_projects = function(player)
     s.projects_open = true
     start_projects(player)
     if (s.result and not s.built) then
-        gui.render(player, s.result)
+        gui.projects_toggled(player)
     end
 end
 
 --- The projects pane's close button: hide it. A search still running pauses (and its lag), to
---- carry on when the pane opens again; finished projects are kept for then too.
+--- carry on where it was when the pane opens again; finished projects are kept for then too.
 gui.callbacks.close_projects = function(player)
     local s = gui.get_storage(player)
     s.projects_open = nil
-    if (s.proj_job) then
-        -- the project being tried starts over: a half-solved copy of the model is too big to keep
-        s.proj_job.fork = nil
-    end
     if (s.result and not s.built) then
-        gui.render(player, s.result)
+        gui.projects_toggled(player)
     end
 end
 
@@ -390,6 +386,11 @@ script.on_event(defines.events.on_tick, function(e)
         return
     end
     for player_index, s in pairs(storage.players) do
+        -- everything waits while the window is closed, and carries on where it was when it opens
+        local owner = game.get_player(player_index)
+        if (owner and owner.valid and not gui.is_open(owner)) then
+            goto continue
+        end
         local built = s.built
         if (built) then
             local player = game.get_player(player_index)
@@ -439,6 +440,7 @@ script.on_event(defines.events.on_tick, function(e)
                 end
             end
         end
+        ::continue::
     end
 end)
 

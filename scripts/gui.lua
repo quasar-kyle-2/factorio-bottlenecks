@@ -24,6 +24,7 @@ local main_window_name = "bottleneck-calc-extreme_wnd_main"
 ---@field result? BCE.Result
 ---@field proj_job? table projects being tried on the solved model (model.whatif_step); paused while their pane is closed
 ---@field projects_open? true the projects pane is shown (Recommend projects); they are only worked out while it is
+---@field projects_details? true the projects pane shows each project's building changes with their numbers
 ---@field detail_item? string node id of the item report shown under the targets
 ---@field detail_missing? { type: string, name: string } picked for the report, but not on the surface
 ---@field detail_history? { list: { id: string?, missing: { type: string, name: string }? }[], pos: integer } reports viewed, for back and forward
@@ -55,6 +56,7 @@ local main_window_name = "bottleneck-calc-extreme_wnd_main"
 ---@field table_projects LuaGuiElement
 ---@field button_recommend_projects LuaGuiElement
 ---@field button_projects_close LuaGuiElement
+---@field button_projects_details LuaGuiElement
 ---@field flow_right LuaGuiElement
 ---@field button_pick_tool LuaGuiElement?
 ---@field button_add_consumers LuaGuiElement
@@ -211,6 +213,14 @@ end
 ---@param e EventData.on_gui_click
 local function on_recommend_projects_click(e)
     gui.callbacks.open_projects(game.get_player(e.player_index) --[[@as LuaPlayer]])
+end
+
+---@param e EventData.on_gui_click
+local function on_projects_details_click(e)
+    local player = game.get_player(e.player_index) --[[@as LuaPlayer]]
+    local s = gui.get_storage(player)
+    s.projects_details = (not s.projects_details) or nil
+    gui.update_projects(player)
 end
 
 ---@param e EventData.on_gui_click
@@ -411,6 +421,8 @@ end
 --- With results the window takes this much of the screen's height and its panes stretch to fill
 --- it; with only the targets showing (no results yet) it shrinks to fit them.
 local WINDOW_HEIGHT_FRACTION = 0.85
+--- The most of the window's height the projects pane takes, scrolling past that.
+local PROJECTS_HEIGHT_FRACTION = 0.6
 
 ---@param player LuaPlayer
 ---@return number
@@ -430,6 +442,9 @@ end
 local function apply_window_height(player, ui)
     local style = ui.wnd_main.style
     local max = get_max_height(player)
+    if (ui.scroll_projects and ui.scroll_projects.valid) then
+        ui.scroll_projects.style.maximal_height = max * PROJECTS_HEIGHT_FRACTION
+    end
     if (has_fill_pane(ui)) then
         style.height = max
     else
@@ -468,6 +483,7 @@ flib_gui.add_handlers({
     on_stop_button_click = on_stop_button_click,
     on_recommend_projects_click = on_recommend_projects_click,
     on_projects_close_click = on_projects_close_click,
+    on_projects_details_click = on_projects_details_click,
     on_pick_tool_click = on_pick_tool_click,
     on_item_button_click = on_item_button_click,
     on_consumers_elem_changed = on_consumers_elem_changed,
@@ -538,8 +554,8 @@ end
 ---@return BCE.GuiElements
 function gui.build(player)
     local s = gui.get_storage(player)
-    -- button_projects_close: a window from an older version of the mod gets rebuilt
-    if (s.gui and s.gui.wnd_main.valid and s.gui.button_projects_close) then
+    -- button_projects_details: a window from an older version of the mod gets rebuilt
+    if (s.gui and s.gui.wnd_main.valid and s.gui.button_projects_details) then
         return s.gui
     end
     local existing = player.gui.screen[main_window_name]
@@ -636,7 +652,16 @@ function gui.build(player)
         name = "table_projects",
         direction = "vertical",
         style_mods = { vertical_spacing = 4, left_padding = 8, right_padding = 8 },
-    }, "projects", "pane_projects", true, {
+    }, "projects", "pane_projects", false, {
+        {
+            type = "sprite-button",
+            name = "button_projects_details",
+            style = "frame_action_button",
+            sprite = "utility/expand",
+            tooltip = { "gui.bottleneck-calc-extreme-projects-details-show" },
+            mouse_button_filter = { "left" },
+            handler = { [defines.events.on_gui_click] = on_projects_details_click },
+        },
         {
             type = "sprite-button",
             name = "button_projects_close",
@@ -647,7 +672,8 @@ function gui.build(player)
             handler = { [defines.events.on_gui_click] = on_projects_close_click },
         },
     }, "scroll_projects")
-    projects_pane.style_mods = { horizontally_stretchable = true, vertically_stretchable = true }
+    -- as tall as its rows (up to PROJECTS_HEIGHT_FRACTION of the window); the items take the rest
+    projects_pane.style_mods = { horizontally_stretchable = true }
     panes[#panes + 1] = {
         type = "flow",
         name = "flow_left",
@@ -1612,6 +1638,19 @@ function gui.update_projects(player)
     update_visibility(s)
 end
 
+--- The projects pane opened or closed: redraw it, and the Productivity line, which waits while
+--- projects are tried. The rest of the window stays as it is.
+---@param player LuaPlayer
+function gui.projects_toggled(player)
+    local s = gui.get_storage(player)
+    if (not (s.gui and s.gui.wnd_main.valid)) then
+        return
+    end
+    render_projects(s)
+    render_prod(s)
+    update_visibility(s)
+end
+
 --- Redraw the report's Productivity section (its job is done).
 ---@param player LuaPlayer
 function gui.update_prod(player)
@@ -1797,6 +1836,58 @@ local function waiting_cell(live, items)
     return flow
 end
 
+--- One effect's icon, repeated up to 4 times, or once with "×N" past that.
+---@param icon string rich text
+---@param count number
+local function effect_icons(icon, count)
+    local n = math.floor(count + 0.5)
+    if (math.abs(count - n) < 1e-6 and n >= 1 and n <= 4) then
+        return string.rep(icon, n)
+    end
+    local amount = math.abs(count - n) < 1e-6 and tostring(n) or string.format("%.1f", count)
+    return icon .. "×" .. amount
+end
+
+--- "Current effects:" of a group: its modules and the beacons on it, as rich text icons.
+---@param conf Rates.Configuration
+local function effects_tooltip(conf)
+    if (conf.type == "meta" and conf.children) then
+        conf = conf.children[1]
+    end
+    local fx = conf and conf.module_effects or {}
+    local parts = {}
+    for _, m in ipairs(fx.modules or {}) do
+        parts[#parts + 1] = effect_icons(string.format("[item=%s,quality=%s]", m.module.name, m.quality.name), m.count)
+    end
+    for _, b in ipairs(fx.beacons or {}) do
+        if (not b.beacon.hidden) then
+            local text = effect_icons(string.format("[entity=%s,quality=%s]", b.beacon.name, b.quality.name), b.count)
+            local inner = {}
+            for _, m in ipairs(b.per_beacon_modules or {}) do
+                inner[#inner + 1] = effect_icons(string.format("[item=%s,quality=%s]", m.module.name, m.quality.name), m.count)
+            end
+            if (#inner > 0) then
+                text = text .. " (" .. table.concat(inner, " ") .. ")"
+            end
+            parts[#parts + 1] = text
+        end
+    end
+    if (#parts == 0) then
+        return { "gui.bottleneck-calc-extreme-detail-effects", { "gui.bottleneck-calc-extreme-detail-effects-none" } }
+    end
+    return { "gui.bottleneck-calc-extreme-detail-effects", table.concat(parts, "  ") }
+end
+
+--- A cost rounded to a whole number, unless that would make it 0: then one decimal.
+---@param x number
+local function round_cost(x)
+    local r = string.format("%.0f", x)
+    if (tonumber(r) == 0 and math.abs(x) >= 0.05) then
+        return string.format("%.1f", x)
+    end
+    return r
+end
+
 ---@param d BCE.DetailRow
 local function detail_row_icons(d)
     local count = math.floor(d.have + 0.5)
@@ -1811,7 +1902,8 @@ local function detail_row_icons(d)
         b.style = "flib_slot_button_default"
         b.style_mods = { size = 36 }
         b.ignored_by_interaction = false
-        b.tooltip = { "", entity_icon.tooltip or b.tooltip or "", "\n",
+        local own = entity_icon.tooltip or b.tooltip
+        b.tooltip = { "", (own and own ~= "") and { "", own, "\n" } or "", effects_tooltip(conf), "\n",
             { "gui.bottleneck-calc-extreme-detail-jump", tostring(#d.row.entities) } }
         b.elem_tooltip = entity_icon.elem_tooltip or b.elem_tooltip
         entity_icon.tooltip, entity_icon.elem_tooltip = nil, nil
@@ -2062,14 +2154,6 @@ render_detail = function(parent, s, result)
     end
     summary[#summary + 1] =
         { type = "label", caption = api.gui.gui_button_and_text(ui, nil).text, style = "bold_label", style_mods = { left_margin = 4 } }
-    if (item) then
-        if (not s.is_pinned) then
-            summary[#summary + 1] = { type = "label", style_mods = { left_margin = 12 },
-                caption = { "gui.bottleneck-calc-extreme-detail-summary", amt(item.needed), amt(item.capacity) } }
-        end
-        summary[#summary + 1] = { type = "label", caption = difference_caption(item.capacity, item.needed, amt),
-            style_mods = { left_margin = 8 } }
-    end
     local compact = s.is_pinned == true
     local row_extra = result.row_extra or {}
     local projects = result.projects and result.projects.list and result.projects or nil
@@ -2081,28 +2165,41 @@ render_detail = function(parent, s, result)
         local p, _, rank = model.regret(projects, ris, row_extra)
         return p and { project = p, rank = rank } or nil
     end
-    if (item and not compact) then
-        local ris = model.extra_rows_of(result, d.id)
-        local n = 0
-        for _, ri in ipairs(ris) do
-            n = n + row_extra[ri]
-        end
-        if (n > 1e-3) then
-            summary[#summary + 1] = { type = "label", style_mods = { left_margin = 12 },
-                caption = { "gui.bottleneck-calc-extreme-detail-summary-new", string.format("%.1f", n) },
-                tooltip = { "gui.bottleneck-calc-extreme-detail-summary-new-tooltip",
-                    string.format("%.2f", (result.price or {})[d.id] or 0), amt(1) } }
-            if (item.coverage and item.coverage < 1 - 1e-6) then
-                local regret = regret_of(ris)
-                if (regret) then
-                    summary[#summary + 1] = regret_mark(regret)
+    if (item) then
+        if (not compact) then
+            -- needed, then the new buildings the plan adds for it, then what the factory can make
+            local needed = { type = "flow", style = "packed_horizontal_flow",
+                style_mods = { vertical_align = "center", left_margin = 12 },
+                { type = "label", caption = { "gui.bottleneck-calc-extreme-detail-summary-needed", amt(item.needed) } } }
+            local ris = model.extra_rows_of(result, d.id)
+            local n = 0
+            for _, ri in ipairs(ris) do
+                n = n + row_extra[ri]
+            end
+            if (n > 1e-3) then
+                needed[#needed + 1] = { type = "label", style_mods = { left_margin = 4 },
+                    caption = { "gui.bottleneck-calc-extreme-detail-summary-new", string.format("%.1f", n) },
+                    tooltip = { "gui.bottleneck-calc-extreme-detail-summary-new-tooltip",
+                        string.format("%.2f", (result.price or {})[d.id] or 0), amt(1) } }
+                if (item.coverage and item.coverage < 1 - 1e-6) then
+                    local regret = regret_of(ris)
+                    if (regret) then
+                        local mark = regret_mark(regret)
+                        mark.style_mods.left_margin = 2
+                        needed[#needed + 1] = mark
+                    end
                 end
             end
+            summary[#summary + 1] = needed
+            summary[#summary + 1] = { type = "label", style_mods = { left_margin = 4 },
+                caption = { "gui.bottleneck-calc-extreme-detail-summary-make", amt(item.capacity) } }
         end
+        summary[#summary + 1] = { type = "label", caption = difference_caption(item.capacity, item.needed, amt),
+            style_mods = { left_margin = 8 } }
     end
     flib_gui.add(parent, summary)
 
-    --- "new" column: the buildings the plan adds to this group beyond the ones you have.
+    --- "add" column: the buildings the plan adds to this group beyond the ones you have.
     ---@param ri integer
     ---@param with_regret boolean
     local function new_cell(ri, with_regret)
@@ -2345,6 +2442,7 @@ end
 --- Width of the build cost and running cost savings bars.
 local BAR_WIDTH = 90
 local BAR_COLOR = { r = 0.2, g = 1, b = 0.2 }
+local BAR_RED = { r = 1, g = 0.25, b = 0.2 }
 --- Rows listed in a project's "no longer needed" and "more needed" columns.
 local PROJECT_DOWNS = 4
 local PROJECT_UPS = 3
@@ -2352,7 +2450,7 @@ local PROJECT_UPS = 3
 --- A group's recipe, small, with how its new buildings change.
 ---@param row BCE.Row
 ---@param d number
-local function project_change(row, d)
+local function project_change(row, d, icon_only)
     local icon = create_node_icon(api.configuration.gui_recipe(row.conf), nil, recipe_pipette(row.conf))
     if (icon[1]) then
         icon[1].style_mods = { size = 28 }
@@ -2362,14 +2460,23 @@ local function project_change(row, d)
         conf = conf.children[1]
     end
     local entity = conf and conf.entity
+    local key = d < 0 and "gui.bottleneck-calc-extreme-projects-change-down-tooltip"
+        or "gui.bottleneck-calc-extreme-projects-change-up-tooltip"
+    local tip = { key, round_cost(math.abs(d)), entity and ("[entity=" .. entity.name .. "]") or "",
+        entity and entity.localised_name or "" }
+    if (icon_only) then
+        -- the number moves to the tooltip
+        local target = (icon[1] and icon[1].ignored_by_interaction == false) and icon[1] or icon
+        target.tooltip = target.tooltip and { "", target.tooltip, "\n", tip } or tip
+        return icon
+    end
     return {
         type = "flow",
         style = "packed_horizontal_flow",
         style_mods = { vertical_align = "center", right_margin = 6 },
         icon,
-        { type = "label", caption = string.format("%s%.1f", d < 0 and "−" or "+", math.abs(d)),
-            tooltip = entity and { "gui.bottleneck-calc-extreme-projects-change-tooltip", "[entity=" .. entity.name .. "]",
-                entity.localised_name } or nil },
+        { type = "label", caption = (d < 0 and "-" or "+") .. round_cost(math.abs(d)),
+            tooltip = tip },
     }
 end
 
@@ -2378,6 +2485,21 @@ end
 local function bar(value, tooltip)
     return { type = "progressbar", value = math.max(0, math.min(1, value)), tooltip = tooltip,
         style_mods = { width = BAR_WIDTH, color = BAR_COLOR } }
+end
+
+--- A red bar that fills from the right: an empty bar, then a full red one. Past 1 it is full.
+---@param value number 0.. (1 = full)
+---@param tooltip LocalisedString
+local function red_bar(value, tooltip)
+    local w = math.floor(BAR_WIDTH * math.max(0, math.min(1, value)) + 0.5)
+    w = math.max(w, 4)
+    if (w > BAR_WIDTH - 4) then
+        return { type = "progressbar", value = 1, tooltip = tooltip, style_mods = { width = BAR_WIDTH, color = BAR_RED } }
+    end
+    return { type = "flow", style = "packed_horizontal_flow", tooltip = tooltip, style_mods = { width = BAR_WIDTH },
+        { type = "progressbar", value = 0, ignored_by_interaction = true, style_mods = { width = BAR_WIDTH - w } },
+        { type = "progressbar", value = 1, ignored_by_interaction = true, style_mods = { width = w, color = BAR_RED } },
+    }
 end
 
 ---@param s BCE.PlayerStorage
@@ -2392,8 +2514,17 @@ render_projects = function(s)
     if (not result) then
         return
     end
-    -- compact: no summary, and no "no longer needed" or "more needed" columns
+    -- compact: no "no longer needed" or "more needed" columns. Without details: the icons of the
+    -- first, without their numbers, and no "more needed"
     local compact = s.is_pinned == true
+    local details = s.projects_details == true
+    local toggle = ui.button_projects_details
+    if (toggle and toggle.valid) then
+        toggle.visible = not compact
+        toggle.sprite = details and "utility/collapse" or "utility/expand"
+        toggle.tooltip = { details and "gui.bottleneck-calc-extreme-projects-details-hide"
+            or "gui.bottleneck-calc-extreme-projects-details-show" }
+    end
     local grey = { font_color = color_grey }
     local pr = result.projects
     if (not pr) then
@@ -2407,14 +2538,11 @@ render_projects = function(s)
         end
         return
     end
-    flib_gui.add(holder, { type = "label", visible = not compact, style_mods = { single_line = false, maximal_width = DETAIL_WIDTH - 40 },
-        caption = { "gui.bottleneck-calc-extreme-projects-summary", string.format("%.0f", pr.extra_buildings),
-            string.format("%.0f", pr.extra_hassle), tostring(pr.tested) } })
     if (#pr.list == 0) then
         flib_gui.add(holder, { type = "label", caption = { "gui.bottleneck-calc-extreme-projects-none" } })
         return
     end
-    local tbl = holder.add({ type = "table", column_count = compact and 4 or 6 })
+    local tbl = holder.add({ type = "table", column_count = compact and 4 or (details and 6 or 5) })
     tbl.style.horizontal_spacing = 10
     tbl.style.vertical_spacing = 2
     tbl.style.column_alignments[2] = "right"
@@ -2430,9 +2558,11 @@ render_projects = function(s)
         header("gui.bottleneck-calc-extreme-projects-col-saves", "projects-saves"),
         header("gui.bottleneck-calc-extreme-projects-col-rent", "projects-rent"),
     }
-    if (not compact) then
-        headers[5] = header("gui.bottleneck-calc-extreme-projects-col-downs")
-        headers[6] = header("gui.bottleneck-calc-extreme-projects-col-ups")
+    if (not compact and details) then
+        headers[5] = header("gui.bottleneck-calc-extreme-projects-col-downs", "projects-downs")
+        headers[6] = header("gui.bottleneck-calc-extreme-projects-col-ups", "projects-ups")
+    elseif (not compact) then
+        headers[5] = header("gui.bottleneck-calc-extreme-projects-col-downs", "projects-replaces")
     end
     flib_gui.add(tbl, headers)
     local max_saved, max_rent = 0, 0
@@ -2452,17 +2582,26 @@ render_projects = function(s)
         }
         local rent
         if (p.drent < -1e-6 and max_rent > 0) then
-            rent = bar(-p.drent / max_rent, { "gui.bottleneck-calc-extreme-projects-rent-tooltip", string.format("%.1f", -p.drent) })
+            rent = bar(-p.drent / max_rent, { "gui.bottleneck-calc-extreme-projects-rent-tooltip", round_cost(-p.drent) })
         else
-            rent = { type = "empty-widget", style_mods = { width = BAR_WIDTH },
-                tooltip = { "gui.bottleneck-calc-extreme-projects-rent-up-tooltip", string.format("%.1f", p.drent) } }
+            -- it goes up: red, on the same scale as the green bars, full past the greatest of them
+            local tip = { "gui.bottleneck-calc-extreme-projects-rent-up-tooltip", round_cost(p.drent) }
+            if (p.drent > 1e-6) then
+                rent = red_bar(max_rent > 0 and p.drent / max_rent or 1, tip)
+            else
+                rent = { type = "empty-widget", style_mods = { width = BAR_WIDTH }, tooltip = tip }
+            end
         end
         local downs = { type = "flow", style = "packed_horizontal_flow", style_mods = { vertical_align = "center" } }
         for i = 1, math.min(PROJECT_DOWNS, #p.downs) do
             local row = rows[p.downs[i].ri]
             if (row) then
-                downs[#downs + 1] = project_change(row, p.downs[i].d)
+                downs[#downs + 1] = project_change(row, p.downs[i].d, not details)
             end
+        end
+        if (#p.downs > PROJECT_DOWNS) then
+            -- spaced from the icons in compact; the numbers in details already space it
+            downs[#downs + 1] = { type = "label", caption = "…", style_mods = { left_margin = details and 0 or 4 } }
         end
         local ups = { type = "flow", style = "packed_horizontal_flow", style_mods = { vertical_align = "center" } }
         for i = 1, math.min(PROJECT_UPS, #p.ups) do
@@ -2471,13 +2610,17 @@ render_projects = function(s)
                 ups[#ups + 1] = project_change(row, p.ups[i].d)
             end
         end
+        if (#p.ups > PROJECT_UPS) then
+            ups[#ups + 1] = { type = "label", caption = "…" }
+        end
         flib_gui.add(tbl, {
             icons,
             { type = "label", caption = string.format("%.1f", p.x), tooltip = { "gui.bottleneck-calc-extreme-projects-build-tooltip" } },
-            bar(max_saved > 0 and p.saved / max_saved or 0, { "gui.bottleneck-calc-extreme-projects-saves-tooltip", string.format("%.0f", p.saved) }),
+            bar(max_saved > 0 and p.saved / max_saved or 0, { "gui.bottleneck-calc-extreme-projects-saves-tooltip", string.format("%.0f", p.saved),
+                string.format("%.0f", pr.extra_hassle) }),
             rent,
             (not compact) and downs or nil,
-            (not compact) and ups or nil,
+            (not compact and details) and ups or nil,
         })
     end
 end

@@ -5,15 +5,20 @@ Date: 2026-11-26
     - Project recommendations: a new pane lists the 10 recipes you don't use yet that would save
       the most build cost (one-time effort) at the speeds you chose, each built fresh in a building
       type you have: how many to build, how much build cost and running cost they save (as bars, the
-      numbers in the tooltips), and which new buildings they make unnecessary or need. They are
+      numbers in the tooltips), and which new buildings they make unnecessary; a button in the
+      pane's title bar shows how many, and which ones they need more of. They are
       slow to work out, so only when you press "Recommend projects" in the Items pane; closing the
       pane pauses the search, and finished recommendations stay until the next Refresh. The item
       report's Productivity section waits while they are worked out
     - Items: a short item better handled by one of those projects gets a red "!", its tooltip
       naming the project
-    - Item report: a "new" column in Goes to and Made by shows the new buildings the plan adds to
+    - Item report: an "add" column in Goes to and Made by shows the new buildings the plan adds to
       each group, and the summary shows how many it adds for the item
+    - Item report: a building group's tooltip lists its current effects: its modules and the
+      beacons on it
   Changes:
+    - The analysis pauses while the window is closed and carries on when you open it again,
+      instead of slowing the game down in the background
     - Extra buildings are planned by build cost: one more building of a group you have costs less than
       a new one, since its belts and pipes are already there
     - Build cost counts belt lanes: an item one lane of your best belt can't carry pays half for
