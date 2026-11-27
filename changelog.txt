@@ -4,8 +4,9 @@ Date: 2026-11-26
   Features:
     - Project recommendations: a new pane lists the 10 recipes you don't use yet that would save
       the most build cost (one-time effort) at the speeds you chose, each built fresh in a building
-      type you have: how many to build, how much build cost and running cost they save (as bars, the
-      numbers in the tooltips), and which new buildings they make unnecessary; a button in the
+      type you have or one your factory makes (an assembler set to make quenching tower MK02s means
+      MK02s are tried): how many to build, how much build cost and running cost they save (as bars,
+      the numbers in the tooltips), and which new buildings they make unnecessary; a button in the
       pane's title bar shows how many, and which ones they need more of. They are
       slow to work out, so only when you press "Recommend projects" in the Items pane; closing the
       pane pauses the search, and finished recommendations stay until the next Refresh. The item

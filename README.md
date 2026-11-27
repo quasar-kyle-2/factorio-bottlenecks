@@ -66,7 +66,7 @@ the last full analysis.
 - Items that come from outside (deliveries, hand-feeding, nexelit ore from dig sites) are capped
   at what came in during the last hour.
 - After the results show, it looks for projects: every recipe you have unlocked but don't use,
-  in every building type you have. The 40 most promising at the plan's prices are each tried on
+  in every building type you have or make (one an assembler of yours is set to build). The 40 most promising at the plan's prices are each tried on
   a copy of the solved plan, and the 10 that save the most build cost are listed, with how much
   running cost they save.
 

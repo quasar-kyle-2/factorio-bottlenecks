@@ -631,7 +631,7 @@ end
 -- the targets are turned up past that fraction of them.
 --
 -- Projects (model.whatif_step): recipes you don't use for your targets yet, each built fresh in a
--- building type you have. The solved plan's item prices pick the promising ones; those are added
+-- building type you have or make. The solved plan's item prices pick the promising ones; those are added
 -- to the solved model as columns locked at 0, and each is unlocked alone on a copy of it, to see
 -- how much hassle it saves.
 
@@ -1128,7 +1128,7 @@ local function same_column(A, c)
 end
 
 --- What the search for project candidates depends on beyond research, recipes, bonuses, belts
---- and the item balances (all the same after a warm Refresh): the building types you have, the
+--- and the item balances (all the same after a warm Refresh): the building types you have or make, the
 --- recipes you use and the items set to unlimited. The same sig means the same candidates.
 ---@param scan BCE.Scan
 ---@param kept integer[]
@@ -1148,6 +1148,30 @@ local function candidate_inputs(scan, kept, modes)
         if (e and (e.type == "assembling-machine" or e.type == "furnace") and not e.fixed_recipe and not seen[e.name]) then
             seen[e.name] = true
             entities[#entities + 1] = { entity = e, quality = conf.quality }
+        end
+    end
+    -- also the building types your factory makes (an assembler set to make quenching towers MK02)
+    local normal = prototypes.quality["normal"]
+    local function add_made(recipe)
+        for _, p in ipairs(recipe.products or {}) do
+            local item = p.type == "item" and prototypes.item[p.name]
+            local e = item and item.place_result
+            if (e and (e.type == "assembling-machine" or e.type == "furnace") and not e.fixed_recipe and not e.hidden and not seen[e.name]) then
+                seen[e.name] = true
+                entities[#entities + 1] = { entity = e, quality = normal }
+            end
+        end
+    end
+    for _, row in ipairs(rows) do
+        local conf = row.conf
+        if (conf and conf.type == "meta" and conf.children) then
+            for _, ch in ipairs(conf.children) do
+                if (ch.recipe) then
+                    add_made(ch.recipe)
+                end
+            end
+        elseif (conf and conf.recipe) then
+            add_made(conf.recipe)
         end
     end
     table.sort(entities, function(a, b) return a.entity.name < b.entity.name end)
@@ -1673,7 +1697,7 @@ end
 -- Projects
 --
 -- A project: a recipe you don't use for your targets yet, built fresh (no modules) in a type of
--- building you have. Once the plan is solved (and shown), every unlocked recipe in every building
+-- building you have, or one your factory makes. Once the plan is solved (and shown), every unlocked recipe in every building
 -- type that can make it is a candidate (spread over ticks). The plan prices every item in hassle;
 -- at those prices the most promising candidates are screened (model.screen), added to the solved
 -- model as locked columns (lp.extend), and each is tried alone on a copy of it: how much hassle it
