@@ -2191,7 +2191,8 @@ render_detail = function(parent, s, result)
                 end
             end
             summary[#summary + 1] = needed
-            summary[#summary + 1] = { type = "label", style_mods = { left_margin = 4 },
+            -- a wider gap after "(N buildings)"
+            summary[#summary + 1] = { type = "label", style_mods = { left_margin = n > 1e-3 and 8 or 4 },
                 caption = { "gui.bottleneck-calc-extreme-detail-summary-make", amt(item.capacity) } }
         end
         summary[#summary + 1] = { type = "label", caption = difference_caption(item.capacity, item.needed, amt),
@@ -2208,7 +2209,7 @@ render_detail = function(parent, s, result)
             return { type = "label", caption = "" }
         end
         local flow = { type = "flow", style = "packed_horizontal_flow", style_mods = { vertical_align = "center" },
-            { type = "label", caption = string.format("+%.1f", x), tooltip = { "gui.bottleneck-calc-extreme-detail-new-tooltip" } } }
+            { type = "label", caption = string.format("+%.1f", x) } }
         local regret = with_regret and regret_of({ ri }) or nil
         if (regret) then
             flow[#flow + 1] = regret_mark(regret)
@@ -2554,7 +2555,7 @@ render_projects = function(s)
     end
     local headers = {
         { type = "label", caption = "" },
-        header("gui.bottleneck-calc-extreme-projects-col-build"),
+        header("gui.bottleneck-calc-extreme-projects-col-build", "projects-build"),
         header("gui.bottleneck-calc-extreme-projects-col-saves", "projects-saves"),
         header("gui.bottleneck-calc-extreme-projects-col-rent", "projects-rent"),
     }
@@ -2615,7 +2616,7 @@ render_projects = function(s)
         end
         flib_gui.add(tbl, {
             icons,
-            { type = "label", caption = string.format("%.1f", p.x), tooltip = { "gui.bottleneck-calc-extreme-projects-build-tooltip" } },
+            { type = "label", caption = string.format("%.1f", p.x) },
             bar(max_saved > 0 and p.saved / max_saved or 0, { "gui.bottleneck-calc-extreme-projects-saves-tooltip", string.format("%.0f", p.saved),
                 string.format("%.0f", pr.extra_hassle) }),
             rent,
