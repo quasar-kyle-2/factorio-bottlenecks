@@ -4,10 +4,10 @@ Date: 2026-11-26
   Features:
     - Project recommendations: a new pane lists the 10 recipes you don't use yet that would save
       the most build cost (one-time effort) at the speeds you chose, each built fresh in a building
-      type you have or one your factory makes (an assembler set to make quenching tower MK02s means
-      MK02s are tried): how many to build, how much build cost and running cost they save (as bars,
-      the numbers in the tooltips), and which new buildings they make unnecessary; a button in the
-      pane's title bar shows how many, and which ones they need more of. They are
+      type you can build (its recipe unlocked), whether or not you have one yet: how many to build,
+      how much build cost and running cost they save (as bars, the numbers in the tooltips), and
+      which new buildings they make unnecessary; a button in the pane's title bar shows how many,
+      and which ones they need more of. They are
       slow to work out, so only when you press "Recommend projects" in the Items pane; closing the
       pane pauses the search, and finished recommendations stay until the next Refresh. The item
       report's Productivity section waits while they are worked out
@@ -43,6 +43,17 @@ Date: 2026-11-26
     - Fuels made for one kind of building (drill heads, fuel rods) are counted as ingredients
     - Items that come from outside the factory (nexelit ore from dig sites, deliveries, what you
       hand-feed) are counted, capped at what came in during the last hour
+    - Pyanodon's mega-farms are counted for what they really do: each launch uses a replicator and
+      grows its crop on the ground, and the harvesters (or flora collectors) around the farm mine
+      it, all of them even while the crop is used up between launches. Before, mova and the other
+      mega-farm crops looked like free ore that only the harvesters standing on crop right then
+      could mine, and nothing counted what the farm itself uses. The crop on the ground shows up
+      as an item of its own, and projects can suggest mega-farm recipes
+    - Rocket launches that bring something back are counted: a rocket silo uses what its rocket
+      carries and makes what the launch returns (Pyanodon's tholins capsule brings back 500 filled
+      tholins vessels, a space dingrit its return, a satellite destabilized toxirus). Before, the
+      silo's rocket parts went nowhere and the returns looked like they came from outside. The
+      cargo is what's in the rocket, or what was in it last, while it's empty between launches
     - Item report: in Made by, building groups left below 100% while another group making the
       item runs past 100% get an info icon by "needed", explaining why they sit idle
   Bugfixes:

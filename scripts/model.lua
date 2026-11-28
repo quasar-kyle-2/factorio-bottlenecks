@@ -321,6 +321,208 @@ local function is_fake_recipe(conf)
     return ok and fake == true
 end
 
+-- ---------------------------------------------------------------------------
+-- Mega-farms (Pyanodon's)
+--
+-- A mega-farm is a rocket silo whose recipe's products never come out. Each craft launches an
+-- invisible rocket carrying one seed item (replicator-mova), and Py's script then spreads the
+-- crop as a resource over the 23 x 23 tiles in front of the farm, where harvesters and flora
+-- collectors (mining drills) mine it. sw-rates-lib gives a silo a send-to-orbit product instead,
+-- so a mega-farm is turned into what it does: per launch it uses a seed item and makes the crop's
+-- resource, the same node the drills mine. Py's own table (mod-data "pyanodons", smart_farm)
+-- says which recipe grows which crop, from which seed, and how much per tile.
+
+--- Tiles a launch covers (Py: x and y from -11 to 11 around the crop area's centre).
+local FARM_TILES = 23 * 23
+--- The crop area's centre, from the farm's position, and how far out Py looks for harvesters.
+local FARM_OFFSET_Y = -15
+local FARM_REACH = 12
+
+local farm_cache = nil ---@type table<string, { launch: LuaItemPrototype, resource: LuaEntityPrototype, yield: number }>?
+
+--- Recipe name -> what a launch of it needs and grows: its seed item, the crop's resource and
+--- the amount per tile. Empty without Pyanodon's.
+local function farm_recipes()
+    if (farm_cache) then
+        return farm_cache
+    end
+    farm_cache = {}
+    local ok, crops = pcall(function() return prototypes.mod_data["pyanodons"].data.smart_farm.crops end)
+    if (not ok or type(crops) ~= "table") then
+        return farm_cache
+    end
+    for launch, crop in pairs(crops) do
+        local item = prototypes.item[launch]
+        local resource = type(crop) == "table" and type(crop.resource) == "string" and prototypes.entity[crop.resource]
+        if (item and resource and type(crop.recipes) == "table") then
+            for name, yield in pairs(crop.recipes) do
+                if (type(yield) == "number" and yield > 0) then
+                    farm_cache[name] = { launch = item, resource = resource, yield = yield }
+                end
+            end
+        end
+    end
+    return farm_cache
+end
+
+--- A mega-farm's amounts as what it really does: its send-to-orbit product becomes one seed item
+--- used per launch and the crop's resource made. Any other configuration's are unchanged.
+---@param conf Rates.Configuration
+---@param raw Rates.Configuration.Amount[]?
+---@return Rates.Configuration.Amount[]?
+local function farm_amounts(conf, raw)
+    local e = raw and conf.type == "crafting-machine" and conf.entity
+    local farm = e and e.type == "rocket-silo" and conf.recipe and farm_recipes()[conf.recipe.name]
+    if (not farm) then
+        return raw
+    end
+    local cap = 1
+    pcall(function() cap = e.get_inventory_size(defines.inventory.rocket_silo_rocket, conf.quality) end)
+    if (not cap or cap <= 0) then
+        cap = 1
+    end
+    local out, launches = {}, 0
+    for _, a in ipairs(raw) do
+        if (a.node.type == "send-to-orbit") then
+            launches = launches + a.amount / cap
+        else
+            out[#out + 1] = a
+        end
+    end
+    if (launches > 0) then
+        local normal = prototypes.quality["normal"]
+        out[#out + 1] = { tag = "ingredient", node = api.node.create.item(farm.launch, normal), amount = -launches }
+        out[#out + 1] = { tag = "product", node = api.node.create.map_entity(farm.resource, normal),
+            amount = launches * farm.yield * FARM_TILES }
+    end
+    return out
+end
+
+--- Harvesters in a mega-farm with no crop under them right now (it grows back with the next
+--- launch): unit number -> the crop's resource, so they count as mining it.
+---@param list LuaEntity[]
+---@param surface LuaSurface
+---@param force LuaForce
+---@return table<integer, LuaEntityPrototype>
+local function farm_drills(list, surface, force)
+    local result = {}
+    if (not next(farm_recipes())) then
+        return result
+    end
+    for _, entity in ipairs(list) do
+        if (entity.type == "rocket-silo") then
+            local ok, recipe = pcall(entity.get_recipe)
+            local farm = ok and recipe and farm_recipes()[recipe.name]
+            if (farm) then
+                local x, y = entity.position.x, entity.position.y + FARM_OFFSET_Y
+                local drills = surface.find_entities_filtered { type = "mining-drill", force = force,
+                    area = { { x - FARM_REACH, y - FARM_REACH }, { x + FARM_REACH, y + FARM_REACH } } }
+                for _, d in ipairs(drills) do
+                    if (d.unit_number and not d.mining_target
+                            and d.prototype.resource_categories[farm.resource.resource_category]) then
+                        result[d.unit_number] = farm.resource
+                    end
+                end
+            end
+        end
+    end
+    return result
+end
+
+-- ---------------------------------------------------------------------------
+-- Rocket cargo
+--
+-- A rocket silo's rocket carries items whose launch brings something back (Pyanodon's tholin
+-- capsule returns 500 filled tholin vessels, a space dingrit its return, a satellite destabilized
+-- toxirus). sw-rates-lib counts the launch on its own (send-to-orbit), which a scan never sees,
+-- so a silo is given what its rocket carries: the cargo is used and the launch products made.
+-- The cargo is what's in the rocket now, or, while it's empty between launches, what was in it
+-- the last time a scan saw it (storage.silo_cargo).
+
+--- What a silo's rocket carries, as item name and quality -> its share of the rocket's slots, and
+--- a key for it ("" when nothing is known). Only items whose launch brings something back.
+---@param entity LuaEntity
+---@return table<string, { item: LuaItemPrototype, quality: LuaQualityPrototype, share: number }>?, string
+local function silo_cargo(entity)
+    if (entity.type ~= "rocket-silo") then
+        return nil, ""
+    end
+    local counts = nil ---@type table<string, number>?
+    local ok, inv = pcall(entity.get_inventory, defines.inventory.rocket_silo_rocket)
+    if (ok and inv) then
+        for _, c in ipairs(inv.get_contents()) do
+            local item = prototypes.item[c.name]
+            if (item and item.rocket_launch_products and #item.rocket_launch_products > 0) then
+                counts = counts or {}
+                local k = c.name .. "/" .. (c.quality or "normal")
+                counts[k] = (counts[k] or 0) + c.count / item.stack_size
+            end
+        end
+    end
+    storage.silo_cargo = storage.silo_cargo or {}
+    if (counts) then
+        storage.silo_cargo[entity.unit_number] = counts
+    else
+        counts = storage.silo_cargo[entity.unit_number]
+    end
+    if (not counts) then
+        return nil, ""
+    end
+    local total, keys = 0, {}
+    for k, n in pairs(counts) do
+        total = total + n
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    local cargo = {}
+    for _, k in ipairs(keys) do
+        local name, quality = k:match("^(.*)/([^/]*)$")
+        local item, q = prototypes.item[name], prototypes.quality[quality]
+        if (item and q and total > 0) then
+            cargo[k] = { item = item, quality = q, share = counts[k] / total }
+        end
+    end
+    if (not next(cargo)) then
+        return nil, ""
+    end
+    return cargo, table.concat(keys, ",")
+end
+
+--- A rocket silo's amounts with its cargo: each rocket slot launched (send-to-orbit) uses a stack
+--- of the cargo and makes what its launch brings back.
+---@param raw Rates.Configuration.Amount[]?
+---@param cargo table<string, { item: LuaItemPrototype, quality: LuaQualityPrototype, share: number }>?
+---@return Rates.Configuration.Amount[]?
+local function cargo_amounts(raw, cargo)
+    if (not raw or not cargo) then
+        return raw
+    end
+    local out, slots = {}, 0
+    for _, a in ipairs(raw) do
+        if (a.node.type == "send-to-orbit") then
+            slots = slots + a.amount
+        else
+            out[#out + 1] = a
+        end
+    end
+    if (slots <= 0) then
+        return raw
+    end
+    for _, c in pairs(cargo) do
+        local n = slots * c.share * c.item.stack_size
+        out[#out + 1] = { tag = "ingredient", node = api.node.create.item(c.item, c.quality), amount = -n }
+        for _, p in ipairs(c.item.rocket_launch_products) do
+            local each = (p.amount or ((p.amount_min or 0) + (p.amount_max or 0)) / 2) * (p.probability or 1)
+                + (p.extra_count_fraction or 0)
+            local proto = prototypes.item[p.name] -- launch products are items
+            if (proto and each > 0) then
+                out[#out + 1] = { tag = "product", node = api.node.create.item(proto, c.quality), amount = n * each }
+            end
+        end
+    end
+    return out
+end
+
 --- What the force has researched and unlocked, as one string: research, recipes enabled and
 --- their productivity, and the force-wide bonuses that change what buildings make. A warm
 --- Refresh (model.warm_build) needs it unchanged. Pyanodon's TURD choices change it too: they
@@ -407,7 +609,7 @@ function model.scan(surface, force, target_ids, use_analyzer)
     local fake_items = {} ---@type table<string, true> made by a show-only recipe
 
     ---@return BCE.Row
-    local function get_row(key, conf, is_target)
+    local function get_row(key, conf, is_target, cargo)
         local row = rows_by_key[key]
         if (not row) then
             local annotations = api.configuration.get_annotations(conf)
@@ -417,6 +619,7 @@ function model.scan(surface, force, target_ids, use_analyzer)
                 use_pollution = use_pollution,
                 annotations = annotations,
             })
+            amounts = cargo_amounts(farm_amounts(conf, amounts), cargo)
             local summed = sum_amounts(amounts or {})
             if (not is_target and is_fake_recipe(conf)) then
                 local kept_amounts = {}
@@ -446,6 +649,7 @@ function model.scan(surface, force, target_ids, use_analyzer)
         return row
     end
 
+    local farm_drill = farm_drills(list, surface, force)
     local target_entities, target_without_conf = 0, 0
     for _, entity in ipairs(list) do
         local is_target = target_ids[entity.unit_number] == true
@@ -454,6 +658,9 @@ function model.scan(surface, force, target_ids, use_analyzer)
         end
         local inputs = ctx and analyzer.get_entity_inputs(ctx, entity) or nil
         local conf = api.configuration.get_from_entity(entity, { use_ghosts = true, analyzer_inputs = inputs })
+        if (conf and conf.type == "mining-drill" and not conf.resource and farm_drill[entity.unit_number]) then
+            conf.resource = farm_drill[entity.unit_number]
+        end
         if (conf) then
             if (conf.type == "meta" and #conf.children > 1 and not is_target) then
                 local meta_id = api.configuration.get_id(conf)
@@ -469,7 +676,14 @@ function model.scan(surface, force, target_ids, use_analyzer)
                 if (is_target) then
                     key = "target|" .. key
                 end
-                local row = get_row(key, conf, is_target)
+                local cargo, cargo_key = nil, ""
+                if (conf.type == "crafting-machine" and not (conf.recipe and farm_recipes()[conf.recipe.name])) then
+                    cargo, cargo_key = silo_cargo(entity)
+                end
+                if (cargo) then
+                    key = key .. "|cargo=" .. cargo_key
+                end
+                local row = get_row(key, conf, is_target, cargo)
                 row.count_max = row.count_max + 1
                 row.entity_ids[#row.entity_ids + 1] = entity.unit_number
                 row.entities[#row.entities + 1] = entity
@@ -631,7 +845,7 @@ end
 -- the targets are turned up past that fraction of them.
 --
 -- Projects (model.whatif_step): recipes you don't use for your targets yet, each built fresh in a
--- building type you have or make. The solved plan's item prices pick the promising ones; those are added
+-- building type you can build. The solved plan's item prices pick the promising ones; those are added
 -- to the solved model as columns locked at 0, and each is unlocked alone on a copy of it, to see
 -- how much hassle it saves.
 
@@ -1127,8 +1341,12 @@ local function same_column(A, c)
     return true
 end
 
+--- Building types a project can be built in: crafting machines that take a recipe you choose
+--- (a rocket silo too: Pyanodon's mega-farms are silos; the real one has a fixed recipe).
+local crafter_types = { ["assembling-machine"] = true, ["furnace"] = true, ["rocket-silo"] = true }
+
 --- What the search for project candidates depends on beyond research, recipes, bonuses, belts
---- and the item balances (all the same after a warm Refresh): the building types you have or make, the
+--- and the item balances (all the same after a warm Refresh): the building types you have, the
 --- recipes you use and the items set to unlimited. The same sig means the same candidates.
 ---@param scan BCE.Scan
 ---@param kept integer[]
@@ -1145,33 +1363,9 @@ local function candidate_inputs(scan, kept, modes)
             conf = conf.children[1]
         end
         local e = conf and conf.type == "crafting-machine" and conf.entity
-        if (e and (e.type == "assembling-machine" or e.type == "furnace") and not e.fixed_recipe and not seen[e.name]) then
+        if (e and crafter_types[e.type] and not e.fixed_recipe and not seen[e.name]) then
             seen[e.name] = true
             entities[#entities + 1] = { entity = e, quality = conf.quality }
-        end
-    end
-    -- also the building types your factory makes (an assembler set to make quenching towers MK02)
-    local normal = prototypes.quality["normal"]
-    local function add_made(recipe)
-        for _, p in ipairs(recipe.products or {}) do
-            local item = p.type == "item" and prototypes.item[p.name]
-            local e = item and item.place_result
-            if (e and (e.type == "assembling-machine" or e.type == "furnace") and not e.fixed_recipe and not e.hidden and not seen[e.name]) then
-                seen[e.name] = true
-                entities[#entities + 1] = { entity = e, quality = normal }
-            end
-        end
-    end
-    for _, row in ipairs(rows) do
-        local conf = row.conf
-        if (conf and conf.type == "meta" and conf.children) then
-            for _, ch in ipairs(conf.children) do
-                if (ch.recipe) then
-                    add_made(ch.recipe)
-                end
-            end
-        elseif (conf and conf.recipe) then
-            add_made(conf.recipe)
         end
     end
     table.sort(entities, function(a, b) return a.entity.name < b.entity.name end)
@@ -1627,7 +1821,7 @@ function model.results(built, scan, speeds)
         row_have[ri] = count
         main_of[ri] = main
         for _, a in ipairs(row.amounts) do
-            if (modes[a.id] ~= nil and nodes[a.id].node.type ~= "map-entity") then
+            if (modes[a.id] ~= nil and (nodes[a.id].node.type ~= "map-entity" or modes[a.id] == "counted")) then
                 if (a.amount < 0) then
                     if (x > 0) then
                         item(a.id).needed = item(a.id).needed - a.amount * x
@@ -1697,7 +1891,7 @@ end
 -- Projects
 --
 -- A project: a recipe you don't use for your targets yet, built fresh (no modules) in a type of
--- building you have, or one your factory makes. Once the plan is solved (and shown), every unlocked recipe in every building
+-- building you can build. Once the plan is solved (and shown), every unlocked recipe in every building
 -- type that can make it is a candidate (spread over ticks). The plan prices every item in hassle;
 -- at those prices the most promising candidates are screened (model.screen), added to the solved
 -- model as locked columns (lp.extend), and each is tried alone on a copy of it: how much hassle it
@@ -1776,14 +1970,32 @@ end
 ---@param surface LuaSurface
 local function candidates_start(scan, built, force, surface)
     local entities, used, sig = candidate_inputs(scan, built.kept, built.modes)
+    local seen = {}
+    for _, e in ipairs(entities) do
+        seen[e.entity.name] = true
+    end
+    local normal = prototypes.quality["normal"]
     local recipes = {}
     for name, r in pairs(force.recipes) do
         local proto = prototypes.recipe[name]
-        if (r.enabled and proto and not proto.hidden and not used[name]) then
-            recipes[#recipes + 1] = proto
+        if (r.enabled and proto and not proto.hidden) then
+            if (not used[name]) then
+                recipes[#recipes + 1] = proto
+            end
+            -- every building type you can build, by an unlocked recipe for the item that places it
+            -- (research and recipe changes start a Refresh cold, so the kept candidates never miss one)
+            for _, p in ipairs(proto.products or {}) do
+                local item = p.type == "item" and prototypes.item[p.name]
+                local e = item and not item.hidden and item.place_result
+                if (e and crafter_types[e.type] and not e.fixed_recipe and not e.hidden and not seen[e.name]) then
+                    seen[e.name] = true
+                    entities[#entities + 1] = { entity = e, quality = normal }
+                end
+            end
         end
     end
     table.sort(recipes, function(a, b) return a.name < b.name end)
+    table.sort(entities, function(a, b) return a.entity.name < b.entity.name end)
     return { force = force, surface = surface, lane = scan.lane_rate, entities = entities, recipes = recipes, ri = 1, ei = 1,
         list = {}, sig = sig }
 end
@@ -1806,6 +2018,7 @@ local function candidates_step(cjob, built, budget)
             local ok, raw = pcall(api.configuration.get_production, cconf,
                 { force = cjob.force, surface = cjob.surface, use_pollution = false })
             if (ok and raw) then
+                raw = farm_amounts(cconf, raw)
                 local summed = sum_amounts(raw)
                 if (plan_can_feed(summed, built)) then
                     cjob.list[#cjob.list + 1] = { n = #cjob.list + 1, recipe = proto, entity = e.entity, quality = e.quality, amounts = summed,

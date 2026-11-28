@@ -65,8 +65,15 @@ the last full analysis.
   rods) are counted too.
 - Items that come from outside (deliveries, hand-feeding, nexelit ore from dig sites) are capped
   at what came in during the last hour.
+- Pyanodon's mega-farms: each launch uses a replicator and grows the crop on the 23 x 23 tiles in
+  front of the farm (Py's yield per tile), which the harvesters there mine. The crop on the ground
+  is an item of its own, and every harvester in the farm counts, even while the crop is used up
+  between launches. The launch itself (the rocket rising) isn't timed, only the recipe.
+- Rocket launches that bring something back (Pyanodon's tholins capsule, space dingrit,
+  satellite): the silo uses what's in its rocket, a full rocket per launch, and makes what the
+  launch returns. While the rocket is empty between launches, it counts what was in it last.
 - After the results show, it looks for projects: every recipe you have unlocked but don't use,
-  in every building type you have or make (one an assembler of yours is set to build). The 40 most promising at the plan's prices are each tried on
+  in every building type you can build. The 40 most promising at the plan's prices are each tried on
   a copy of the solved plan, and the 10 that save the most build cost are listed, with how much
   running cost they save.
 

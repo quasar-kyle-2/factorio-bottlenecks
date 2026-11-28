@@ -1765,6 +1765,9 @@ local function node_signal(node)
         return { type = "fluid", name = node.fluid.name }
     elseif (node.type == "any" and node.details and node.details.type == "any-fluid" and node.details.fluid) then
         return { type = "fluid", name = node.details.fluid.name }
+    elseif (node.type == "map-entity") then
+        -- a crop a mega-farm grows, for its harvesters
+        return { type = "entity", name = node.entity.name }
     end
     return nil
 end
